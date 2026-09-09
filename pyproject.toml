@@ -1,0 +1,38 @@
+[project]
+name = "master-thesis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Flashness123", email = "lukas.kouba.de@gmail.com" }
+]
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "einops==0.8.2",
+    "stable-pretraining==0.1.8",
+    "stable-worldmodel[env,format,train]==0.1.1",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
+]
+
+[project.scripts]
+master-thesis = "master_thesis:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+stable-worldmodel = { git = "https://github.com/galilai-group/stable-worldmodel.git", rev = "b72edab" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

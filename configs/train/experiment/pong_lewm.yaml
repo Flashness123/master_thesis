@@ -1,0 +1,57 @@
+defaults:
+  - /dataset: pong_onehot
+  - /model: lewm
+  - _self_
+
+
+run_name: pong/lewm
+seed: 3072
+
+train_split: 0.9
+
+img_size: 224
+embed_dim: 192
+
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+
+trainer:
+  max_epochs: 100
+
+  accelerator: gpu
+  devices: 1
+
+  precision: bf16-mixed
+
+  gradient_clip_val: 1.0
+
+
+loader:
+  batch_size: 32
+
+  num_workers: 4
+
+  shuffle: true
+  drop_last: true
+
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+
+loss:
+  sigreg:
+    weight: 0.09
+
+    kwargs:
+      knots: 17
+      num_proj: 1024

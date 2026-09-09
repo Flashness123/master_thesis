@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.env
+
+# Experiment data
+/data/
+/runs/
+/checkpoints/
+/outputs/
+/wandb/
+/lightning_logs/
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

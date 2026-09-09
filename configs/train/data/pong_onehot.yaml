@@ -1,0 +1,16 @@
+name: ${oc.env:STABLEWM_HOME}/datasets/pong_random.lance
+
+# LeWM history_size=3 + num_preds=1 -> 4 observations.
+num_steps: ${eval:'${wm.history_size} + ${wm.num_preds}'}
+
+# One LeWM transition spans four raw Pong emulator frames.
+frameskip: 4
+
+keys_to_load:
+  - pixels
+  - action
+
+
+action:
+  encoding: one_hot
+  num_actions: 6
