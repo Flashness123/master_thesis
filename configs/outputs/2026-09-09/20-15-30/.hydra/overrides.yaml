@@ -1,0 +1,3 @@
+- trainer.max_epochs=1
+- loader.num_workers=0
+- loader.persistent_workers=false

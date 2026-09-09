@@ -1,8 +1,9 @@
+# @package _global_
+
 defaults:
-  - /dataset: pong_onehot
+  - /data: pong_onehot
   - /model: lewm
   - _self_
-
 
 run_name: pong/lewm
 seed: 3072
