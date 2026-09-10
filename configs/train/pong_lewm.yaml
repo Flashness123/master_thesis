@@ -1,46 +1,37 @@
-# @package _global_
+# @package _global_  
+# makes this config globally reachable cfg.trainer instead of cfg.train.trainer
 
-defaults:
+defaults:  # create one big env out of this + lewm.yaml + pong_onehot
   - /data: pong_onehot
   - /model: lewm
   - _self_
 
 run_name: pong/lewm
 seed: 3072
-
-train_split: 0.9
-
+train_split: 0.9 # 90% train
 img_size: 224
 embed_dim: 192
-
 
 wm:
   history_size: 3
   num_preds: 1
 
-
 trainer:
   max_epochs: 100
-
   accelerator: gpu
   devices: 1
-
   precision: bf16-mixed
-
   gradient_clip_val: 1.0
 
 
 loader:
   batch_size: 32
-
   num_workers: 4
-
-  shuffle: true
-  drop_last: true
-
-  persistent_workers: true
-  prefetch_factor: 2
-  pin_memory: true
+  shuffle: true  # training samples are randomized every epoch
+  drop_last: true  # if the final training batch contains fewer than 32 samples, discard it
+  persistent_workers: true  # don't destroy/recreate workers between epochs
+  prefetch_factor: 2  #each worker prepares batches ahead of the GPU
+  pin_memory: true  # DataLoader allocates CPU tensors in pinned memory, generally improving CPU→CUDA transfers
 
 
 optimizer:
@@ -52,7 +43,6 @@ optimizer:
 loss:
   sigreg:
     weight: 0.09
-
     kwargs:
       knots: 17
       num_proj: 1024

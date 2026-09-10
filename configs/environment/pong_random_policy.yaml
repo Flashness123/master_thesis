@@ -1,33 +1,20 @@
 world:
-  env_name: ALE/Pong-v5
-  num_envs: 1
-  image_shape: [224, 160]
-  goal_conditioned: false
-  render_mode: rgb_array
-
-  # We want one environment step to equal one emulator frame.
-  # Temporal abstraction is handled later by the SWM Dataset.
-  frameskip: 1
-
-  # Deterministic dynamics are easier for our first world-model baseline.
-  repeat_action_probability: 0.0
-
-  # Use Pong's meaningful 6-action subset instead of all 18 Atari actions.
-  full_action_space: false
-
-  # Fixed trajectory horizon for our training dataset.
-  max_episode_steps: 1000
-
+  env_name: ALE/Pong-v5  # Which gymnasium env to create
+  num_envs: 1  # SWM can vectorize environments
+  image_shape: [224, 160]  # native atari is 210×160
+  goal_conditioned: false  # if it provides an explicit goal observation
+  render_mode: rgb_array  # return arrays x visible game window
+  frameskip: 1  # disable ataris action repetition and handle it with the dataset frameskip
+  repeat_action_probability: 0.0  # no occasional action repetition
+  full_action_space: false  # use Pong's meaningful 6-action subset instead of all 18 Atari actions.
+  max_episode_steps: 1000  # max steps per episode
 
 policy:
-  seed: 42
-
+  seed: 42  # seed for the random policy
 
 collection:
-  path: ${oc.env:STABLEWM_HOME}/datasets/pong_random.lance
-
+  path: ${oc.env:STABLEWM_HOME}/datasets/pong_random.lance  # dataset path
   episodes: 100
-  seed: 42
-
-  format: lance
-  mode: overwrite
+  seed: 42  # seed for the gym env
+  format: lance  # ml table format like: episode_idx | step_idx | pixels | action | reward |  - cosnumed like a dictionary
+  mode: overwrite  # overwrite x append

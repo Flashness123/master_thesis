@@ -1,0 +1,66 @@
+Shapes:
+
+Lance dataset
+─────────────────────────────────────
+pixels              action IDs
+[4,3,224,160]       [4,4]
+
+              ↓ transforms
+
+LeWM input
+─────────────────────────────────────
+pixels              one-hot actions
+[4,3,224,224]       [4,24]
+
+              ↓ DataLoader
+
+batch
+─────────────────────────────────────
+pixels              actions
+[B,4,3,224,224]     [B,4,24]
+
+              ↓ JEPA.encode()
+
+latent states        action latents
+[B,4,192]           [B,4,192]
+
+              ↓ slicing
+
+context
+[z0,z1,z2]
+[B,3,192]
+
+actions
+[A0,A1,A2]
+[B,3,192]
+
+targets
+[z1,z2,z3]
+[B,3,192]
+
+              ↓ ARPredictor
+
+predictions
+[ẑ1,ẑ2,ẑ3]
+[B,3,192]
+
+              ↓
+
+MSE(predictions, targets)
++
+0.09 × SIGReg(z0,z1,z2,z3)
+
+              ↓
+
+backpropagation
+              ↓
+
+update:
+ViT
+projector
+action encoder
+predictor
+prediction projector
+
+How to use:
+uv run python -m master_thesis.training.lewm --config-name train/arc_lewm trainer.max_epochs=1 # the trainer.max_epochs=1 are direct edits in the config
