@@ -175,17 +175,59 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   return output_path
 
 
+def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, output_path: Path | None = None, ) -> list[Path]:
+  """Collect one or more recordings with consecutive seeds.
+
+  An explicit output path is supported only for a single recording.
+  Otherwise each run receives its own automatically generated path.
+  """
+  if runs < 1:
+    raise ValueError("runs must be at least 1")
+
+  if max_steps < 1:
+    raise ValueError("max_steps must be at least 1")
+
+  if mode not in MODE_MAP:
+    raise ValueError(f"Unknown ARC mode: {mode}")
+
+  if output_path is not None and runs != 1:
+    raise ValueError("output_path can only be used with runs=1")
+
+  recordings = []
+
+  for run_index in range(runs):
+    run_seed = seed + run_index
+    print(f"\n--- Run {run_index + 1}/{runs} (seed={run_seed}) ---")
+
+    recording = collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=output_path, )
+    recordings.append(recording)
+
+  print("\nCollection complete")
+  print(f"Runs: {len(recordings)}")
+  print(f"Total requested actions (upper bound): {runs * max_steps}")
+
+  return recordings
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=("Collect ARC-AGI-3 trajectories for world-model training"))
   parser.add_argument("game", type=str, help=("ARC game ID, e.g. ls20"), )
-  parser.add_argument("--max-steps", type=int, default=50, help=("Maximum number of actual policy actions"))
+  parser.add_argument("--max-steps", type=int, default=50, help=("Maximum number of actual policy actions per run"))
   parser.add_argument("--seed", type=int, default=42, )
   parser.add_argument("--mode", choices=["normal", "offline", "online", ], default="normal", )
-  parser.add_argument("--output", type=Path, default=None, help=("Optional explicit JSONL recording path"))
+  parser.add_argument("--output", type=Path, default=None, help=("Optional explicit JSONL recording path; requires --runs 1"))
+  parser.add_argument("--runs", type=int, default=1, help=("Number of recordings; seeds start at --seed and increase by one"))
 
   args = parser.parse_args()
 
-  collect_game(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, output_path=args.output, )
+  if args.runs < 1:
+    parser.error("--runs must be at least 1")
+  if args.max_steps < 1:
+    parser.error("--max-steps must be at least 1")
+  if args.output is not None and args.runs != 1:
+    parser.error("--output can only be used with --runs 1")
+
+  collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, output_path=args.output, )
 
 
 if __name__ == "__main__":
