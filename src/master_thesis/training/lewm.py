@@ -261,23 +261,58 @@ def lewm_forward(self, batch, stage, cfg, ):
   return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
 
 
-def build_dataloaders(dataset, cfg: DictConfig, ):
+def build_dataloaders(dataset, cfg: DictConfig):
+  train_fraction = cfg.train_split
+  val_fraction = cfg.val_split
+
+  if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and train_fraction + val_fraction < 1):
+    raise ValueError("train_split and val_split must be positive and sum to less than 1")
+
+  # Include only episodes that supply at least one SWM window.
+  episode_ids = sorted({episode for episode, _ in dataset.clip_indices})
+
   generator = torch.Generator().manual_seed(cfg.seed)
+  order = torch.randperm(len(episode_ids), generator=generator).tolist()
+  episode_ids = [episode_ids[index] for index in order]
 
-  train_set, val_set = spt.data.random_split(dataset, lengths=[cfg.train_split, 1 - cfg.train_split, ], generator=generator, )
+  num_train = int(len(episode_ids) * train_fraction)
+  num_val = int(len(episode_ids) * val_fraction)
+  num_test = len(episode_ids) - num_train - num_val
 
-  loader_cfg = OmegaConf.to_container(cfg.loader, resolve=True, )
+  if min(num_train, num_val, num_test) < 1:
+    raise ValueError("Not enough eligible episodes for these split proportions")
 
-  train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator, )
+  episode_groups = (episode_ids[:num_train], episode_ids[num_train:num_train + num_val], episode_ids[num_train + num_val:], )
 
-  val_loader_cfg = dict(loader_cfg)
+  # Map each episode to one split: 0=train, 1=val, 2=test.
+  episode_to_split = {}
+  for split_index, episodes in enumerate(episode_groups):
+    for episode in episodes:
+      episode_to_split[episode] = split_index
 
-  val_loader_cfg["shuffle"] = False
-  val_loader_cfg["drop_last"] = False
+  # Assign every window according to its episode.
+  window_groups = [[], [], []]
+  for window_index, (episode, _) in enumerate(dataset.clip_indices):
+    split_index = episode_to_split[episode]
+    window_groups[split_index].append(window_index)
 
-  val_loader = torch.utils.data.DataLoader(val_set, **val_loader_cfg, )
+  train_set, val_set, test_set = [torch.utils.data.Subset(dataset, indices) for indices in window_groups]
 
-  return train_loader, val_loader
+  for name, episodes, indices in zip(("train", "val", "test"), episode_groups, window_groups):
+    print(f"{name}: {len(episodes)} episodes, {len(indices)} windows")
+
+  loader_cfg = OmegaConf.to_container(cfg.loader, resolve=True)
+
+  train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator)
+
+  eval_loader_cfg = dict(loader_cfg)
+  eval_loader_cfg["shuffle"] = False
+  eval_loader_cfg["drop_last"] = False
+
+  val_loader = torch.utils.data.DataLoader(val_set, **eval_loader_cfg)
+  test_loader = torch.utils.data.DataLoader(test_set, **eval_loader_cfg)
+
+  return train_loader, val_loader, test_loader
 
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name=None)
@@ -295,7 +330,7 @@ def main(cfg: DictConfig) -> None:
   # print("action:", sample["action"].shape, sample["action"].dtype, )
   # print("action[0]:", sample["action"][0], )
 
-  train_loader, val_loader = build_dataloaders(dataset, cfg, )
+  train_loader, val_loader, test_loader = build_dataloaders(dataset, cfg)
 
   model = hydra.utils.instantiate(cfg.model, )
 
