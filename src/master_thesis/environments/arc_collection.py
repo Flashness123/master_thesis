@@ -33,7 +33,7 @@ def get_stablewm_home() -> Path:
     raise RuntimeError("STABLEWM_HOME is not set") from exc
 
 
-def default_recording_path(game_id: str, seed: int, ) -> Path:
+def default_recording_path(game_id: str, seed: int, policy_name: str = "random") -> Path:
   timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
   recordings_dir = (get_stablewm_home() / "datasets" / "arc_recordings")
@@ -42,7 +42,7 @@ def default_recording_path(game_id: str, seed: int, ) -> Path:
 
   short_game_id = game_id.split("-")[0]
 
-  return (recordings_dir / (f"random-{short_game_id}"
+  return (recordings_dir / (f"{policy_name}-{short_game_id}"
                             f"-seed{seed}"
                             f"-{timestamp}.jsonl"))
 
@@ -66,7 +66,7 @@ def record_frame(file: TextIO, frame_data: FrameDataRaw, ) -> None:
   file.flush()
 
 
-def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path | None = None, ) -> Path:
+def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random") -> Path:
   """
   Collect one ARC trajectory using a random policy.
 
@@ -103,10 +103,19 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   if observation is None:
     raise RuntimeError("ARC environment returned no initial observation")
 
-  policy = ArcRandomPolicy(seed=seed)
+  if policy_name == "random":
+    policy = ArcRandomPolicy(seed=seed)
+
+  elif policy_name == "goose":
+    from master_thesis.policies.arc_goose import StochasticGoose
+
+    policy = StochasticGoose(available_actions=env.action_space, seed=seed, )
+
+  else:
+    raise ValueError(f"Unknown policy: {policy_name}")
 
   if output_path is None:
-    output_path = (default_recording_path(game_id=game_id, seed=seed, ))
+    output_path = (default_recording_path(game_id=game_id, seed=seed, policy_name=policy_name))
 
   output_path = Path(output_path)
 
@@ -159,9 +168,14 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
       # Playground loop, which records at the start of the
       # next iteration and can therefore miss the final
       # post-action state when an agent reaches its step limit.
-      record_frame(file, next_observation, )
+      record_frame(file, next_observation)
+      observation = next_observation
 
-      observation = (next_observation)
+      if (policy_name == "goose" and observation.state in (GameState.GAME_OVER, GameState.WIN)):
+        policy.choose_action(frame=np.asarray(observation.frame[-1]), available_actions=env.action_space, episode_finished=True, )
+
+        print(f"Goose episode ended: {observation.state.name}")
+        break
 
   print(f"Game: {game_id}")
 
@@ -175,7 +189,7 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   return output_path
 
 
-def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, output_path: Path | None = None, ) -> list[Path]:
+def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", output_path: Path | None = None, ) -> list[Path]:
   """Collect one or more recordings with consecutive seeds.
 
   An explicit output path is supported only for a single recording.
@@ -199,7 +213,7 @@ def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int =
     run_seed = seed + run_index
     print(f"\n--- Run {run_index + 1}/{runs} (seed={run_seed}) ---")
 
-    recording = collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=output_path, )
+    recording = collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=output_path, policy_name=policy_name)
     recordings.append(recording)
 
   print("\nCollection complete")
@@ -217,6 +231,7 @@ def main() -> None:
   parser.add_argument("--mode", choices=["normal", "offline", "online", ], default="normal", )
   parser.add_argument("--output", type=Path, default=None, help=("Optional explicit JSONL recording path; requires --runs 1"))
   parser.add_argument("--runs", type=int, default=1, help=("Number of recordings; seeds start at --seed and increase by one"))
+  parser.add_argument("--policy", choices=["random", "goose"], default="random")
 
   args = parser.parse_args()
 
@@ -227,7 +242,7 @@ def main() -> None:
   if args.output is not None and args.runs != 1:
     parser.error("--output can only be used with --runs 1")
 
-  collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, output_path=args.output, )
+  collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, policy_name=args.policy, output_path=args.output, )
 
 
 if __name__ == "__main__":
