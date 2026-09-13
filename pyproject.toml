@@ -41,6 +41,7 @@ dependencies = [
     "einops==0.8.2",
     "stable-pretraining==0.1.8",
     "stable-worldmodel[env,format,train]==0.1.1",
+    "tensorboard>=2.21.0",
     "torch==2.14.0",
     "torchvision==0.29.0",
 ]

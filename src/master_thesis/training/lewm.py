@@ -12,6 +12,8 @@ from stable_worldmodel.wm.utils import save_pretrained
 from functools import partial
 from pathlib import Path
 from master_thesis.models.lewm import SIGReg
+from lightning.pytorch.loggers import TensorBoardLogger
+from master_thesis.evaluation.world_model_metrics import world_model_metrics
 
 
 class DiscreteActionOneHot:
@@ -258,6 +260,10 @@ def lewm_forward(self, batch, stage, cfg, ):
 
   self.log_dict({f"{stage}/loss": loss.detach(), f"{stage}/pred_loss": prediction_loss.detach(), f"{stage}/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=True, sync_dist=True, )
 
+  if not self.training:
+    metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
+    self.log_dict({f"{stage}/{name}": value for name, value in metrics.items()}, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )
+
   return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
 
 
@@ -356,7 +362,9 @@ def main(cfg: DictConfig) -> None:
 
   OmegaConf.save(cfg, run_dir / "config.yaml", )
 
-  trainer = pl.Trainer(**cfg.trainer, default_root_dir=run_dir, )
+  logger = TensorBoardLogger(save_dir=str(run_dir), name="tensorboard", default_hp_metric=False, )
+
+  trainer = pl.Trainer(**cfg.trainer, default_root_dir=run_dir, logger=logger, )
 
   manager = spt.Manager(trainer=trainer, module=module, data=data_module, )
 
