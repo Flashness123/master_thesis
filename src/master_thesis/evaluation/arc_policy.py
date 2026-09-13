@@ -79,5 +79,4 @@ class LevelEvaluation(BaseCallback):
     return True
 
   def _on_training_end(self):
-    if self.last_evaluation != self.num_timesteps:
-      self._evaluate()
+    self._evaluate()

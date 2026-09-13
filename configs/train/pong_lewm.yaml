@@ -8,7 +8,8 @@ defaults:  # create one big env out of this + lewm.yaml + pong_onehot
 
 run_name: pong/lewm
 seed: 3072
-train_split: 0.9 # 90% train
+train_split: 0.8
+val_split: 0.1
 img_size: 224
 embed_dim: 192
 

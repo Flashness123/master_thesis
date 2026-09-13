@@ -11,6 +11,8 @@ train_split: 0.8
 val_split: 0.1
 img_size: 224
 embed_dim: 192
+sampling:
+  success_probability_sampling: 0.2
 
 wm:
   history_size: 3

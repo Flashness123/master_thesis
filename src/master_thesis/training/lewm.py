@@ -267,6 +267,101 @@ def lewm_forward(self, batch, stage, cfg, ):
   return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
 
 
+def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed):
+  """Sample levels, outcome groups, episodes, then windows."""
+  p = float(success_probability_sampling)
+
+  if not 0 < p < 1:
+    raise ValueError("success_probability_sampling must be between 0 and 1")
+
+  if not train_indices:
+    raise ValueError("The training split contains no windows")
+
+  # Read metadata directly from Lance.
+  # These columns do not need to enter model-input batches.
+  start_levels = torch.as_tensor(dataset.get_col_data("start_level")).reshape(-1)
+
+  successes = torch.as_tensor(dataset.get_col_data("episode_success")).reshape(-1)
+
+  total_rows = sum(int(length) for length in dataset.lengths)
+
+  if start_levels.numel() != total_rows or successes.numel() != total_rows:
+    raise ValueError("Expected one metadata value per stored state")
+
+  # Validate episode labels and identify levels with eligible windows.
+  eligible_episodes = sorted({episode for episode, _ in dataset.clip_indices})
+  metadata = {}
+
+  for episode in eligible_episodes:
+    offset = int(dataset.offsets[episode])
+    length = int(dataset.lengths[episode])
+
+    episode_levels = start_levels[offset:offset + length]
+    episode_successes = successes[offset:offset + length]
+
+    level_value = float(episode_levels[0].item())
+    success_value = float(episode_successes[0].item())
+
+    if (not torch.isfinite(episode_levels).all().item() or level_value < 1 or not level_value.is_integer() or not (episode_levels == level_value).all().item()):
+      raise ValueError(f"Episode {episode}: starting level is unknown or inconsistent")
+
+    if (success_value not in (0.0, 1.0) or not (episode_successes == success_value).all().item()):
+      raise ValueError(f"Episode {episode}: success label must be consistently 0 or 1")
+
+    metadata[episode] = (int(level_value), bool(success_value))
+
+  # Positions here refer to train_set, not the full dataset.
+  episode_positions = {}
+
+  for position, window_index in enumerate(train_indices):
+    episode, _ = dataset.clip_indices[window_index]
+    episode_positions.setdefault(episode, []).append(position)
+
+  # Group training episodes by starting level and success.
+  groups = {}
+
+  for episode in episode_positions:
+    level, successful = metadata[episode]
+    groups.setdefault(level, {False: [], True: []})
+    groups[level][successful].append(episode)
+
+  dataset_levels = {level for level, _ in metadata.values()}
+  missing_levels = dataset_levels - set(groups)
+
+  if missing_levels:
+    raise ValueError("Eligible levels missing from the training split: "
+                     f"{sorted(missing_levels)}. Add coverage or revise the episode split.")
+
+  weights = torch.zeros(len(train_indices), dtype=torch.double)
+  level_probability = 1.0 / len(groups)
+
+  for level, outcomes in sorted(groups.items()):
+    has_success = bool(outcomes[True])
+    has_failure = bool(outcomes[False])
+
+    effective_success_probability = (p if has_success and has_failure else float(has_success))
+
+    print(f"Sampler level {level}: "
+          f"{len(outcomes[True])} successful episodes, "
+          f"{len(outcomes[False])} unsuccessful episodes; "
+          f"level probability={level_probability:.3f}, "
+          f"success probability={effective_success_probability:.2f}")
+
+    for successful, episodes in outcomes.items():
+      if not episodes:
+        continue
+
+      outcome_probability = (effective_success_probability if successful else 1.0 - effective_success_probability)
+
+      episode_probability = (level_probability * outcome_probability / len(episodes))
+
+      for episode in episodes:
+        positions = episode_positions[episode]
+        weights[positions] = episode_probability / len(positions)
+
+  return torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=len(train_indices), replacement=True, generator=torch.Generator().manual_seed(seed), )
+
+
 def build_dataloaders(dataset, cfg: DictConfig):
   train_fraction = cfg.train_split
   val_fraction = cfg.val_split
@@ -306,10 +401,23 @@ def build_dataloaders(dataset, cfg: DictConfig):
 
   for name, episodes, indices in zip(("train", "val", "test"), episode_groups, window_groups):
     print(f"{name}: {len(episodes)} episodes, {len(indices)} windows")
-
   loader_cfg = OmegaConf.to_container(cfg.loader, resolve=True)
+  sampling_cfg = cfg.get("sampling")
 
-  train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator)
+  if sampling_cfg is not None:
+    if cfg.data.type != "arc":
+      raise ValueError("This balanced sampler currently supports ARC only")
+
+    sampler = build_arc_sampler(dataset=dataset, train_indices=window_groups[0], success_probability_sampling=sampling_cfg.success_probability_sampling, seed=int(cfg.seed) + 1, )
+
+    train_loader_cfg = dict(loader_cfg)
+
+    # The sampler controls sample selection and order.
+    train_loader_cfg.pop("shuffle", None)
+
+    train_loader = torch.utils.data.DataLoader(train_set, **train_loader_cfg, sampler=sampler, generator=generator, )
+  else:
+    train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator, )
 
   eval_loader_cfg = dict(loader_cfg)
   eval_loader_cfg["shuffle"] = False
@@ -356,9 +464,13 @@ def main(cfg: DictConfig) -> None:
 
   stablewm_home = Path(os.environ["STABLEWM_HOME"])
 
-  run_dir = (stablewm_home / "runs" / cfg.run_name)
+  run_dir = stablewm_home / "runs" / cfg.run_name
+  checkpoint_dir = stablewm_home / "checkpoints" / cfg.run_name
 
-  run_dir.mkdir(parents=True, exist_ok=True, )
+  if run_dir.exists() or checkpoint_dir.exists():
+    raise FileExistsError(f"Run {cfg.run_name!r} already exists. Choose a new run_name.")
+
+  run_dir.mkdir(parents=True, exist_ok=False)
 
   OmegaConf.save(cfg, run_dir / "config.yaml", )
 

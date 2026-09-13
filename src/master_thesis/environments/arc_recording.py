@@ -18,6 +18,7 @@ CLICK_ACTION = 6
 class ArcTransition:
   game_id: str
   episode: int
+  start_level: int
 
   state: np.ndarray
   action: np.ndarray
@@ -217,6 +218,11 @@ def build_lance_episodes(transitions: list[ArcTransition], ) -> list[dict[str, l
 
   for episode_transitions in grouped.values():
     first = episode_transitions[0]
+    if any(transition.start_level != first.start_level for transition in episode_transitions):
+      raise ValueError(f"Episode {first.episode} contains inconsistent starting levels")
+
+    # Valid levels are one-based; 0 explicitly means unknown.
+    stored_start_level = (first.start_level if first.start_level is not None else 0)
 
     grids = [first.state, *[transition.next_state for transition in episode_transitions], ]
 
@@ -230,7 +236,9 @@ def build_lance_episodes(transitions: list[ArcTransition], ) -> list[dict[str, l
 
     game_ids = [first.game_id] * len(grids)
 
-    episode_data = {"grid": grids, "action": actions, "terminal": terminal, "levels_completed": levels_completed, "available_actions": available_actions, "game_id": game_ids, }
+    episode_success = any(transition.levels_completed_after > transition.levels_completed_before or transition.game_state == "WIN" for transition in episode_transitions)
+
+    episode_data = {"grid": grids, "action": actions, "terminal": terminal, "levels_completed": levels_completed, "available_actions": available_actions, "game_id": game_ids, "start_level": [stored_start_level] * len(grids), "episode_success": [episode_success] * len(grids)}
 
     lengths = {key: len(value) for key, value in episode_data.items()}
 
@@ -240,6 +248,20 @@ def build_lance_episodes(transitions: list[ArcTransition], ) -> list[dict[str, l
     episodes.append(episode_data)
 
   return episodes
+
+
+def get_start_level(event: dict[str, Any]) -> int | None:
+  """Read an explicit one-based starting level; None means unknown."""
+  level = event.get("start_level")
+
+  if level is None:
+    return None
+
+  # bool is a subclass of int, so reject it explicitly.
+  if isinstance(level, bool) or not isinstance(level, int) or level < 1:
+    raise ValueError(f"start_level must be a positive integer, got {level!r}")
+
+  return level
 
 
 def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
@@ -269,22 +291,29 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
   previous_frame = None
 
   episode = -1
+  episode_start_level: int | None = None
 
   for row_index, event in enumerate(events):
     data = event["data"]
-
+    recorded_start_level = get_start_level(event)
     frame = get_final_frame(event)
     action = get_raw_action(event)
 
     is_reset = (bool(data.get("full_reset", False)) or (action is not None and int(action[0]) == 0))
 
-    if is_reset:
-      episode += 1
+    if previous_data is None or previous_frame is None:
+      episode = max(episode, 0)
+      episode_start_level = recorded_start_level
 
       previous_data = data
       previous_frame = frame
 
       continue
+
+    if (recorded_start_level is not None and recorded_start_level != episode_start_level):
+      raise ValueError(f"Event {row_index}: inconsistent start_level within episode "
+                       f"{episode}. Expected {episode_start_level!r}, "
+                       f"got {recorded_start_level!r}")
 
     # A recording could theoretically begin without
     # containing its original RESET event.
@@ -316,8 +345,8 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
     terminal = game_state in {"WIN", "GAME_OVER", }
 
     transitions.append(
-      ArcTransition(game_id=str(data["game_id"]), episode=max(episode, 0), state=previous_frame, action=action, next_state=frame, terminal=terminal, game_state=game_state, levels_completed_before=int(previous_data.get("levels_completed", 0,
-                                                                                                                                                                                                                          )),
+      ArcTransition(game_id=str(data["game_id"]), episode=max(episode, 0), start_level=episode_start_level, state=previous_frame, action=action, next_state=frame, terminal=terminal, game_state=game_state, levels_completed_before=int(previous_data.get("levels_completed", 0,
+                                                                                                                                                                                                                                                           )),
                     levels_completed_after=int(data.get("levels_completed", 0,
                                                         )), available_actions=available_actions, next_available_actions=tuple(int(value) for value in data.get("available_actions", [],
                                                                                                                                                                )),

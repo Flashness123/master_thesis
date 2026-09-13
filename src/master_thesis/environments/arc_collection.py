@@ -168,7 +168,7 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
     raise ValueError(f"Unknown policy: {policy_name}")
 
   if output_path is None:
-    output_path = (default_recording_path(game_id=game_id, seed=seed, policy_name=policy_name))
+    output_path = (default_recording_path(game_id=game_id, seed=seed, policy_name=policy_name, start_level=start_level))
 
   output_path = Path(output_path)
 
