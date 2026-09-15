@@ -64,3 +64,23 @@ prediction projector
 
 How to use:
 uv run python -m master_thesis.training.lewm --config-name train/arc_lewm trainer.max_epochs=1 # the trainer.max_epochs=1 are direct edits in the config
+
+
+
+
+++++++++++++++++++++++++++++++
+How to run:
+PPO training on lewm:
+uv run python -m master_thesis.training.ppo \
+  --input lewm \
+  --lewm-run "arc/ls20_3060ti_20260913_234616/lewm_ppo_round1" \
+  --lewm-weights weights.pt \
+  --game ls20-9607627b \
+  --run-name "arc/ls20_3060ti_20260913_234616/ppo_lewm_round1_$(date +%Y%m%d_%H%M%S)" \
+  --steps 204800 \
+  --max-steps 500 \
+  --history 3 \
+  --eval-every 20480 \
+  --eval-episodes 10 \
+  --seed 42 \
+  --device cuda

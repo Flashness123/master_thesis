@@ -448,6 +448,21 @@ def main(cfg: DictConfig) -> None:
 
   model = hydra.utils.instantiate(cfg.model, )
 
+  init_weights = cfg.get("init_weights")
+
+  if init_weights:
+    checkpoint = Path(init_weights)
+
+    saved_model_config = OmegaConf.load(checkpoint.parent / "config.json")
+
+    if (OmegaConf.to_container(saved_model_config, resolve=True) != OmegaConf.to_container(cfg.model, resolve=True)):
+      raise ValueError("Current model configuration differs from the source checkpoint")
+
+    state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True, )
+
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Initialized LeWM from: {checkpoint}")
+
   total_steps = (cfg.trainer.max_epochs * len(train_loader))
 
   if total_steps < 2:

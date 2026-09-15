@@ -105,7 +105,7 @@ def reset_at_level(env: LocalEnvironmentWrapper, start_level: int, ) -> FrameDat
   return observation
 
 
-def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None) -> Path:
+def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, ) -> Path:
   """
   Collect one ARC trajectory using a random policy.
 
@@ -162,7 +162,14 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   elif policy_name == "goose":
     from master_thesis.policies.arc_goose import StochasticGoose
 
-    policy = StochasticGoose(available_actions=env.action_space, seed=seed, )
+    policy = StochasticGoose(available_actions=env.action_space, seed=seed)
+
+  elif policy_name == "ppo_images":  # !!! Inspect this !!! - I dont hink that giving a policy as a function argument is the cleanest way here!
+    if ppo_policy is None:
+      raise ValueError("Use collect_runs(..., ppo_checkpoint=...) for PPO collection")
+
+    policy = ppo_policy
+    policy.reset(seed=seed, available_actions=env.action_space, game_id=observation.game_id, )
 
   else:
     raise ValueError(f"Unknown policy: {policy_name}")
@@ -224,10 +231,11 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
       record_frame(file, next_observation, start_level=start_level)
       observation = next_observation
 
-      if (policy_name == "goose" and observation.state in (GameState.GAME_OVER, GameState.WIN)):
-        policy.choose_action(frame=np.asarray(observation.frame[-1]), available_actions=env.action_space, episode_finished=True, )
+      if policy_name in ("goose", "ppo_images") and observation.state in (GameState.GAME_OVER, GameState.WIN):
+        if policy_name == "goose":
+          policy.choose_action(frame=np.asarray(observation.frame[-1]), available_actions=env.action_space, episode_finished=True, )
 
-        print(f"Goose episode ended: {observation.state.name}")
+        print(f"{policy_name} episode ended: {observation.state.name}")
         break
 
   print(f"Game: {game_id}")
@@ -242,37 +250,55 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   return output_path
 
 
-def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", output_path: Path | None = None, start_level: int | None = None) -> list[Path]:
-  """Collect one or more recordings with consecutive seeds.
+def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", output_path: Path | None = None, start_level: int | None = None, ppo_checkpoint: Path | None = None, device: str = "auto", output_dir: Path | None = None,
+                 ) -> list[Path]:
+  """Collect runs; load a frozen PPO checkpoint once for the whole batch."""
 
-  An explicit output path is supported only for a single recording.
-  Otherwise each run receives its own automatically generated path.
-  """
-  if runs < 1:
-    raise ValueError("runs must be at least 1")
-
-  if max_steps < 1:
-    raise ValueError("max_steps must be at least 1")
+  if runs < 1 or max_steps < 1:
+    raise ValueError("runs and max_steps must be positive")
 
   if mode not in MODE_MAP:
     raise ValueError(f"Unknown ARC mode: {mode}")
 
-  if output_path is not None and runs != 1:
-    raise ValueError("output_path can only be used with runs=1")
+  if output_path is not None and (runs != 1 or output_dir is not None):
+    raise ValueError("output_path requires runs=1 and no output_dir")
+
+  ppo_policy = None
+
+  if policy_name == "ppo_images":
+    if ppo_checkpoint is None:
+      raise ValueError("ppo_images requires ppo_checkpoint")
+
+    from master_thesis.policies.arc_ppo import ArcImagePPOPolicy
+
+    ppo_policy = ArcImagePPOPolicy(ppo_checkpoint, device=device, )
+
+  elif ppo_checkpoint is not None:
+    raise ValueError("ppo_checkpoint is only used with ppo_images")
+
+  if output_dir is not None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    settings = {"game_id": game_id, "policy": policy_name, "runs": runs, "seed": seed, "start_level": start_level, "max_steps": max_steps, "mode": mode, "device": device, "ppo_checkpoint": (str(ppo_checkpoint) if ppo_checkpoint else None), }
+
+    (output_dir / "collection.json").write_text(json.dumps(settings, indent=2), encoding="utf-8", )
 
   recordings = []
 
   for run_index in range(runs):
     run_seed = seed + run_index
-    print(f"\n--- Run {run_index + 1}/{runs} (seed={run_seed}) ---")
 
-    recording = collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=output_path, policy_name=policy_name, start_level=start_level)
-    recordings.append(recording)
+    path = output_path
+    if output_dir is not None:
+      path = output_dir / f"{policy_name}_seed{run_seed}.jsonl"
 
-  print("\nCollection complete")
-  print(f"Runs: {len(recordings)}")
-  print(f"Total requested actions (upper bound): {runs * max_steps}")
+    print(f"\n--- Run {run_index + 1}/{runs} "
+          f"(seed={run_seed}) ---")
 
+    recordings.append(collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=path, policy_name=policy_name, start_level=start_level, ppo_policy=ppo_policy, ))
+
+  print(f"\nCollection complete: {len(recordings)} recordings")
   return recordings
 
 
@@ -284,8 +310,11 @@ def main() -> None:
   parser.add_argument("--mode", choices=["normal", "offline", "online", ], default="normal", )
   parser.add_argument("--output", type=Path, default=None, help=("Optional explicit JSONL recording path; requires --runs 1"))
   parser.add_argument("--runs", type=int, default=1, help=("Number of recordings; seeds start at --seed and increase by one"))
-  parser.add_argument("--policy", choices=["random", "goose"], default="random")
+  parser.add_argument("--policy", choices=["random", "goose", "ppo_images"], default="random")
   parser.add_argument("--start-level", type=int, default=None, help="Start each recording at this level, numbered from 1; local modes only", )
+  parser.add_argument("--ppo-checkpoint", type=Path, default=None, )
+  parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", )
+  parser.add_argument("--output-dir", type=Path, default=None, )
   args = parser.parse_args()
 
   if args.runs < 1:
@@ -300,7 +329,7 @@ def main() -> None:
     if args.mode == "online":
       parser.error("--start-level requires normal or offline mode")
 
-  collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, policy_name=args.policy, output_path=args.output, start_level=args.start_level)
+  collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, policy_name=args.policy, output_path=args.output, start_level=args.start_level, ppo_checkpoint=args.ppo_checkpoint, device=args.device, output_dir=args.output_dir, )
 
 
 if __name__ == "__main__":
