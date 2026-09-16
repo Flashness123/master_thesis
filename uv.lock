@@ -1287,6 +1287,8 @@ source = { editable = "." }
 dependencies = [
     { name = "arc-agi" },
     { name = "einops" },
+    { name = "matplotlib" },
+    { name = "pillow" },
     { name = "stable-pretraining" },
     { name = "stable-worldmodel", extra = ["env", "format", "train"] },
     { name = "tensorboard" },
@@ -1304,6 +1306,8 @@ dev = [
 requires-dist = [
     { name = "arc-agi", specifier = ">=0.9.9" },
     { name = "einops", specifier = "==0.8.2" },
+    { name = "matplotlib", specifier = ">=3.10.9" },
+    { name = "pillow", specifier = ">=12.3.0" },
     { name = "stable-pretraining", specifier = "==0.1.8" },
     { name = "stable-worldmodel", extras = ["env", "format", "train"], git = "https://github.com/galilai-group/stable-worldmodel.git?rev=b72edab" },
     { name = "tensorboard", specifier = ">=2.21.0" },

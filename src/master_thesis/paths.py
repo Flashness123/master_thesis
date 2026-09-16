@@ -5,6 +5,7 @@ $STABLEWM_HOME/
 ├── arc_environments/                   ARC game files (managed by arc_agi)
 ├── recordings/<game>/<collection>/     raw JSONL episodes + collection.json
 ├── datasets/<game>/<dataset>.lance     converted Lance datasets (+ <dataset>.json provenance)
+├── evaluation/<game>/                  evaluation outputs, file names start with the dataset/model name
 └── models/<kind>/<run>/                everything of one trained model; kind = "lewm" or "ppo"
 
 <game> is the base game id without version ("ls20-9607627b" -> "ls20").
@@ -49,6 +50,11 @@ def recordings_dir(game_id: str) -> Path:
 def dataset_path(game_id: str, name: str) -> Path:
   """Lance table path of a dataset of one game."""
   return stablewm_home() / "datasets" / game_folder(game_id) / f"{name}.lance"  # e.g. datasets/ls20/goose_l1-7.lance
+
+
+def evaluation_dir(game_id: str) -> Path:
+  """Folder for evaluation outputs (tables, plots, GIFs) of one game; file names start with the dataset or model name."""
+  return stablewm_home() / "evaluation" / game_folder(game_id)  # e.g. evaluation/ls20
 
 
 def model_dir(kind: str, name: str) -> Path:

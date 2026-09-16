@@ -204,6 +204,11 @@ def build_lance_episodes(transitions: list[ArcTransition], ) -> list[dict[str, l
         if any(transition.start_level != first.start_level for transition in episode_transitions):
             raise ValueError(f"Episode {first.episode} contains inconsistent starting levels")
 
+        counters_before = {transition.levels_completed_before for transition in episode_transitions}  # completion counter before each action
+        completed_early = any(t.levels_completed_after > t.levels_completed_before for t in episode_transitions[:-1])  # a completion before the last action?
+        if len(counters_before) != 1 or completed_early:  # only the last action may complete the level, otherwise the episode spans more than one level
+            raise ValueError(f"Episode {first.episode} spans more than one level")
+
         # Valid levels are one-based; 0 explicitly means unknown.
         stored_start_level = (first.start_level if first.start_level is not None else 0)
 
@@ -278,30 +283,17 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
 
     for row_index, event in enumerate(events):
         data = event["data"]
+        if "frame" not in data:  # not a game step, e.g. the scorecard summary at the end of ARC Prize human recordings
+            continue
         recorded_start_level = get_start_level(event)
         frame = get_final_frame(event)
         action = get_raw_action(event)
 
         is_reset = (bool(data.get("full_reset", False)) or (action is not None and int(action[0]) == 0))
 
-        if previous_data is None or previous_frame is None:
-            episode = max(episode, 0)
-            episode_start_level = recorded_start_level
-
-            previous_data = data
-            previous_frame = frame
-
-            continue
-
-        if (recorded_start_level is not None and recorded_start_level != episode_start_level):
-            raise ValueError(f"Event {row_index}: inconsistent start_level within episode "
-                             f"{episode}. Expected {episode_start_level!r}, "
-                             f"got {recorded_start_level!r}")
-
-        # A recording could theoretically begin without
-        # containing its original RESET event.
-        if (previous_data is None or previous_frame is None):
-            episode = max(episode, 0)
+        if previous_data is None or previous_frame is None or is_reset:  # new episode: first line, after WIN/GAME_OVER, or after a RESET (the reset jump is never a learnable transition)
+            episode += 1  # each episode gets its own number, so build_lance_episodes never merges two of them
+            episode_start_level = (recorded_start_level or 1) + int(data.get("levels_completed", 0))  # level being played = recording's start level (1 if not recorded, e.g. human runs) + levels completed so far
 
             previous_data = data
             previous_frame = frame
@@ -344,6 +336,10 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
         else:
             previous_data = data
             previous_frame = frame
+
+            if transitions[-1].levels_completed_after > transitions[-1].levels_completed_before:  # this action completed a level
+                episode += 1  # the completion frame (already showing the next level) ends this episode and starts the next one
+                episode_start_level = (recorded_start_level or 1) + transitions[-1].levels_completed_after  # the new episode plays the next level
 
     return transitions  # all transitions of the file, in order
 

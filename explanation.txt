@@ -1,44 +1,49 @@
-Shapes:
+==============================================================================
+LEWM ON ARC: SHAPES (training/lewm.py, models/lewm/)
+==============================================================================
+B = batch size (32), history = 3, num_preds = 1 -> one sample = 4 consecutive states of one episode
 
-Lance dataset
+Lance dataset, one window (swm LanceDataset, num_steps=4)
 ─────────────────────────────────────
-pixels              action IDs
-[4,3,224,160]       [4,4]
+grid                        action
+[4,4096] float32            [4,3] = [id, x, y]
+colour index 0..15          a_t = action taken IN s_t (last state of an episode: dummy [0,-1,-1])
 
-              ↓ transforms
+              ↓ transforms (DataLoader workers, CPU)
+                ArcGridToPixels:   palette -> RGB, nearest resize 64 -> 224, ImageNet normalization
+                ArcActionEncoding: 7-D one-hot + x/63 + y/63 (dummy action -> zeros)
 
 LeWM input
 ─────────────────────────────────────
-pixels              one-hot actions
-[4,3,224,224]       [4,24]
+pixels                      action
+[4,3,224,224]               [4,9]
 
-              ↓ DataLoader
+              ↓ DataLoader (level/success weighted sampler, batch B)
 
 batch
 ─────────────────────────────────────
-pixels              actions
-[B,4,3,224,224]     [B,4,24]
+pixels                      action          (grid [B,4,4096] is carried along, unused)
+[B,4,3,224,224]             [B,4,9]
 
               ↓ JEPA.encode()
+                encoder:        ViT-tiny, patch 14 -> 16x16 patches + CLS, 12 layers, width 192
+                                CLS token [B*4,192]
+                projector:      MLP 192 -> 2048 -> 192 (BatchNorm)
+                action encoder: Embedder 9 -> 192
 
-latent states        action latents
-[B,4,192]           [B,4,192]
+latent states z0..z3        action latents e(a0)..e(a3)
+[B,4,192]                   [B,4,192]
 
               ↓ slicing
 
-context
-[z0,z1,z2]
-[B,3,192]
+context            [z0,z1,z2]              [B,3,192]
+context actions    [e(a0),e(a1),e(a2)]     [B,3,192]   (e(a3) unused)
+targets            [z1,z2,z3]              [B,3,192]   (not detached)
 
-actions
-[A0,A1,A2]
-[B,3,192]
-
-targets
-[z1,z2,z3]
-[B,3,192]
-
-              ↓ ARPredictor
+              ↓ JEPA.predict()
+                ARPredictor: 6 causal transformer layers, action conditioning via AdaLN,
+                             position t sees z0..zt and a0..at
+                pred_proj:   MLP 192 -> 2048 -> 192 (BatchNorm)
 
 predictions
 [ẑ1,ẑ2,ẑ3]
@@ -46,51 +51,165 @@ predictions
 
               ↓
 
-MSE(predictions, targets)
-+
-0.09 × SIGReg(z0,z1,z2,z3)
+loss = MSE(predictions, targets) + 0.09 × SIGReg(z0,z1,z2,z3)
+       SIGReg: 1024 random directions, compares the batch distribution with a standard Gaussian (anti-collapse)
 
-              ↓
+              ↓ backpropagation (bf16-mixed), gradient clipping 1.0,
+                AdamW lr 5e-5 (1% linear warmup, cosine to 0), weight decay 1e-3
 
-backpropagation
-              ↓
-
-update:
-ViT
+update (everything is trained jointly):
+ViT encoder
 projector
 action encoder
 predictor
 prediction projector
 
-Storage layout ($STABLEWM_HOME, see src/master_thesis/paths.py):
-recordings/<game>/<collection>_<MMDD-HHMM>/   datasets/<game>/<dataset>.lance   models/lewm|ppo/<run>_<MMDD-HHMM>/
+validation only (evaluation/world_model_metrics.py, shuffled validation batches):
+  copy_loss / copy_gap        prediction vs. "nothing changes" (z(t+1) = z(t))
+  action_gap                  extra error when only a2 is replaced by another sample's a2
+  rollout_loss                ẑ3 from z0 only (own predictions fed back) vs. z3; baseline rollout_copy_loss (z3 = z0)
+  batch_latent_std            spread of the embeddings across the batch (≈ 0 = collapse)
 
-How to run:
-Collect recordings (one collection folder with level_1 ... level_7):
+saved at the end: models/lewm/<run>/weights.pt + model_config.json (+ train_config.yaml, hydra_overrides.yaml)
+
+used by PPO (training/ppo.py, --input lewm):
+  each real 64x64 grid -> same transform -> frozen JEPA.encode -> z [192]
+  observation = last 3 embeddings concatenated [576] -> actor/critic MLPs [128,128]
+
+==============================================================================
+HOW TO USE
+==============================================================================
+
+0. Setup (every new terminal)
+------------------------------------------------------------------------------
+cd /home/lukas/TU_Dresden/master_thesis/thesis_repo
+export STABLEWM_HOME="/home/lukas/TU_Dresden/master_thesis/data/stable_worldmodel"
+
+Storage layout below $STABLEWM_HOME (defined in src/master_thesis/paths.py):
+  arc_environments/                        ARC game files
+  recordings/<game>/<collection>/          raw JSONL recordings (+ collection.json)
+  datasets/<game>/<dataset>.lance          converted datasets (+ <dataset>.json: which recordings went in)
+  models/lewm/<run>_<MMDD-HHMM>/           weights.pt, model_config.json, train_config.yaml, hydra_overrides.yaml, tensorboard/
+  models/ppo/<run>_<MMDD-HHMM>/            policy.zip, train_config.json, evaluation.jsonl, train.monitor.csv, tensorboard/
+  evaluation/<game>/                       evaluation outputs, file names start with the dataset name
+
+Current ls20 datasets: goose_l1-7_v2, ppo-images_l1-7_v2, goose-ppo_l1_cut, human_l1-7
+
+
+1. Record episodes (JSONL)
+------------------------------------------------------------------------------
+One call = one collection folder recordings/<game>/<name>_<MMDD-HHMM>/ with level_<k>/ subfolders.
+Seeds: seed + start_level * 10000 + run index.
+
+Goose, 100 episodes per level:
 uv run python -m master_thesis.environments.arc_collection ls20-9607627b \
   --mode offline --policy goose --start-levels 1 2 3 4 5 6 7 --runs 100 --max-steps 500 --seed 42
 
-Convert a collection into datasets/ls20/<dataset>.lance:
+Frozen image-PPO as policy (name of a folder in models/ppo):
+uv run python -m master_thesis.environments.arc_collection ls20-9607627b \
+  --mode offline --policy ppo_images --ppo-run ls20_images_l1-7_0914-1220 \
+  --start-levels 1 2 3 4 5 6 7 --runs 100 --max-steps 500 --seed 900000 --device cuda
+
+Options: --name <text> replaces the default collection name <policy>_<levels>.
+
+
+2. Convert recordings into a dataset (JSONL -> Lance)
+------------------------------------------------------------------------------
+Input: a collection folder (all .jsonl inside, also in level_<k>/) or a single .jsonl file.
+Output: datasets/<game>/<dataset>.lance + <dataset>.json
+
 uv run python -m master_thesis.environments.arc_recording \
-  "$STABLEWM_HOME/recordings/ls20/goose_l1-7_0913-2346" --dataset goose_l1-7
+  "$STABLEWM_HOME/recordings/ls20/goose_l1-7_0913-2346" --dataset goose_l1-7_v2
 
-LeWM training (saved to models/lewm/<run_name>_<MMDD-HHMM>):
+Only inspect (nothing is written): leave out --dataset; --show N prints N transitions of the first file.
+--mode error (default) refuses an existing dataset, --mode append adds to it, --mode overwrite replaces it.
+
+What the converter does:
+  - one episode per level attempt: a new episode starts at the first frame, after WIN/GAME_OVER,
+    after a RESET, and after a level completion
+  - the completion step stays in the finished level's episode (its last frame already shows the next level)
+  - level of an episode = recorded start_level (1 if missing, e.g. human runs) + levels_completed
+  - it stops with an error if an episode would contain more than one level
+  - lines without a frame (e.g. the scorecard summary in human recordings) are skipped
+
+Human data example:
+uv run python -m master_thesis.environments.arc_recording \
+  "$STABLEWM_HOME/recordings/ls20/human_l1-7_arcprize" --dataset human_l1-7
+
+
+3. Evaluate a dataset (metrics, heatmap, GIFs)
+------------------------------------------------------------------------------
+Output in evaluation/<game>/:
+  <dataset>_metrics.csv     per level: episodes, success %, actions, mean episode length, mean changed cells,
+                            no-change steps %, distinct grids, coverage %, share of each action
+  <dataset>_heatmap.png     per level: share of steps in which each cell changed
+  <dataset>_gifs/           <dataset>_level<k>_episode<idx>_<success|fail>.gif
+
+Metrics + heatmap:
+uv run python -m master_thesis.evaluation.arc_dataset_metric_visualization --dataset human_l1-7
+
+Additionally 5 random GIFs of successful level-2 episodes:
+uv run python -m master_thesis.evaluation.arc_dataset_metric_visualization --dataset human_l1-7 \
+  --gifs 5 --gif-level 2 --gif-success yes --seed 0
+  (--gif-level: default any level; --gif-success any|yes|no; same --seed -> same episodes)
+
+GIFs only, from Python (e.g. a notebook):
+from master_thesis.evaluation.arc_dataset_metric_visualization import save_episode_gifs
+save_episode_gifs("ls20", "ppo-images_l1-7_v2", 3, level=1, success=False, seed=0)
+
+
+4. Train LeWM
+------------------------------------------------------------------------------
+Config: configs/train/arc_lewm.yaml (+ configs/data/arc_ls20.yaml, configs/model/lewm.yaml).
+Every key can be changed on the command line (key=value). Output: models/lewm/<run_name>_<MMDD-HHMM>/
+Default run_name: ls20_<dataset>; set your own description with run_name=...
+
+Fresh model:
 uv run python -m master_thesis.training.lewm --config-name train/arc_lewm \
-  data.dataset=goose_l1-7 run_name=ls20_goose-l1-7_10ep trainer.max_epochs=10 \
+  data.dataset=goose_l1-7_v2 run_name=ls20_goose-l1-7_10ep trainer.max_epochs=10 \
   loader.batch_size=32 loader.num_workers=2 sampling.success_probability_sampling=0.2
-  (continue from a model: ++init_weights=$STABLEWM_HOME/models/lewm/<run>/weights.pt)
 
-++++++++++++++++++++++++++++++
-PPO training on lewm (saved to models/ppo/<run-name>_<MMDD-HHMM>):
+Continue from an existing model (only the weights are loaded; optimizer and schedule start fresh):
+  add  ++init_weights=$STABLEWM_HOME/models/lewm/<run>/weights.pt
+Make sure no init_weights is set if you want a fresh model:
+  add  ++init_weights=null
+
+Useful keys: data.dataset, trainer.max_epochs, loader.batch_size, loader.num_workers,
+             sampling.success_probability_sampling (share of successful episodes per level), seed
+Show the final config without training: add  --cfg job
+Watch training: uv run tensorboard --logdir "$STABLEWM_HOME/models/lewm"
+Validation metrics (validate/...): pred_loss vs copy_loss, action_gap, rollout_loss vs rollout_copy_loss,
+                                   batch_latent_std, sigreg_loss
+
+
+5. Train PPO (real ARC game)
+------------------------------------------------------------------------------
+Output: models/ppo/<run-name>_<MMDD-HHMM>/ ; --steps must be a multiple of 2048.
+--levels: allowed start levels (default all); training continues into the next level after a completion,
+evaluation stops at the first completion.
+
+On a frozen LeWM (name of a folder in models/lewm):
 uv run python -m master_thesis.training.ppo \
   --input lewm \
   --lewm-run ls20_goose-ppo-l1_ft130ep_0914-2034 \
   --game ls20-9607627b \
+  --levels 1 \
   --run-name ls20_lewm-l1_l1 \
-  --steps 204800 \
+  --steps 614400 \
   --max-steps 500 \
   --history 3 \
   --eval-every 20480 \
   --eval-episodes 10 \
   --seed 42 \
   --device cuda
+
+On images (own CNN, no LeWM):
+uv run python -m master_thesis.training.ppo \
+  --input images \
+  --game ls20-9607627b \
+  --run-name ls20_images_l1-7 \
+  --steps 204800 --max-steps 500 --history 3 --eval-every 20480 --eval-episodes 10 --seed 42 --device cuda
+
+Results: evaluation.jsonl (one line per evaluation game: training_steps, level, success, actions),
+         train.monitor.csv (one line per training episode), TensorBoard: eval/level_<k>/success_rate
+Watch training: uv run tensorboard --logdir "$STABLEWM_HOME/models/ppo"
