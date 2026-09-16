@@ -149,43 +149,6 @@ def get_raw_action(event: dict[str, Any]) -> np.ndarray | None:
     return np.asarray([action_id, -1, -1], dtype=np.int16, )  # simple action (ls20: always this case)
 
 
-def encode_arc_action(action: np.ndarray, ) -> np.ndarray:
-    """
-  Convert our raw ARC action into the representation given to LeWM.
-
-  Output:
-      7 action-type dimensions + normalized x + normalized y
-
-  Total: 9 dimensions.
-  """
-    action = np.asarray(action)
-
-    if action.shape != (3, ):
-        raise ValueError(f"Expected raw ARC action shape (3,), got {action.shape}")
-
-    action_id, x, y = (int(value) for value in action)
-
-    if not 1 <= action_id <= NUM_ACTIONS:
-        raise ValueError("LeWM actions must be ACTION1..ACTION7, "
-                         f"got {action_id}")
-
-    encoded = np.zeros(NUM_ACTIONS + 2, dtype=np.float32, )
-
-    # ACTION1 -> index 0
-    # ...
-    # ACTION7 -> index 6
-    encoded[action_id - 1] = 1.0
-
-    if action_id == CLICK_ACTION:
-        if not (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE):
-            raise ValueError(f"ACTION6 coordinates out of range: ({x}, {y})")
-
-        encoded[-2] = x / (GRID_SIZE - 1)
-        encoded[-1] = y / (GRID_SIZE - 1)
-
-    return encoded # 9-D float32 vector
-
-
 def encode_available_actions(actions: tuple[int, ...], ) -> np.ndarray:  # allowed action IDs → 7-value 0/1 mask
     """
   Encode the currently available ARC action types as a 7-D mask.
@@ -455,13 +418,11 @@ def main() -> None:
         print(f"Actions seen: {sorted({ int(t.action[0]) for t in transitions})}")
 
     for index, transition in enumerate(transitions[:args.show]):
-        encoded = encode_arc_action(transition.action)
         changed_cells = int(np.count_nonzero(transition.state != transition.next_state))
 
         print(f"\nTransition {index}")
         print(f"episode: {transition.episode}")
         print(f"raw action [id, x, y]: {transition.action.tolist()}")
-        print(f"LeWM action (9D): {encoded.tolist()}")
         print(f"changed cells: {changed_cells}")
         print(f"next state: {transition.game_state}")
         print("  levels: "

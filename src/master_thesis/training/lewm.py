@@ -17,48 +17,6 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from master_thesis.evaluation.world_model_metrics import world_model_metrics
 
 
-class DiscreteActionOneHot:  # PONG ONLY: action IDs → flattened one-hot vectors
-  """
-    Convert temporally grouped discrete action IDs to one-hot vectors.
-
-    Example with frameskip=4 and six actions:
-
-        [0, 2, 2, 3]
-
-    becomes:
-
-        4 x 6 one-hot values
-
-    and is flattened to a 24-dimensional action vector.
-    """
-
-  def __init__(self, num_actions: int):
-    self.num_actions = num_actions
-
-  def __call__(self, actions: torch.Tensor) -> torch.Tensor:
-    """
-        Convert grouped discrete action IDs to one-hot vectors.
-
-        SWM uses an undefined action at episode boundaries. For floating-point
-        action spaces this is represented as NaN. For integer discrete action
-        spaces, the NaN can become a negative integer sentinel during collection.
-
-        Both cases are therefore treated as "no action" and encoded as an
-        all-zero vector.
-        """
-
-    valid = (torch.isfinite(actions) & (actions >= 0) & (actions < self.num_actions))
-
-    safe_actions = torch.where(valid, actions, torch.zeros_like(actions), ).long()
-
-    one_hot = F.one_hot(safe_actions, num_classes=self.num_actions, ).float()
-
-    # Invalid/boundary actions become the zero vector rather than action 0.
-    one_hot = one_hot * valid.unsqueeze(-1)
-
-    return one_hot.flatten(start_dim=-2)
-
-
 class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image for the ViT
   """
   Convert an ARC-AGI-3 categorical 64x64 grid into RGB pixels for
@@ -125,7 +83,7 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
     return (pixels - mean) / std  # normalized [T, 3, 224, 224]
 
 
-class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (the same logic as encode_arc_action in arc_recording.py, written a second time)
+class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (the only implementation of this encoding)
   """
   Convert canonical ARC actions:
 
@@ -178,45 +136,21 @@ class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (the same logic as en
     return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )
 
 
-def build_image_transform(img_size: int):  # PONG ONLY: image preprocessing for real RGB frames
-  """
-    LeWM image preprocessing:
-    uint8 RGB -> float -> ImageNet normalization -> square resize.
-    """
-  image_stats = dt.dataset_stats.ImageNet
-
-  to_image = dt.transforms.ToImage(**image_stats, source="pixels", target="pixels", )
-
-  resize = dt.transforms.Resize(img_size, source="pixels", target="pixels", )
-
-  return dt.transforms.Compose(to_image, resize, )
-
-
 def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows and attaches the transforms
+  if cfg.data.type != "arc":  # the training pipeline supports ARC data only
+    raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
+
   dataset_name = cfg.data.name
 
   dataset = swm.data.load_dataset(dataset_name, transform=None, frameskip=cfg.data.frameskip, num_steps=(cfg.wm.history_size + cfg.wm.num_preds), keys_to_load=list(cfg.data.keys_to_load), )
 
-  if cfg.data.type == "pong":
-    image_transform = build_image_transform(cfg.img_size)
+  grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))
 
-    action_transform = (dt.transforms.WrapTorchTransform(DiscreteActionOneHot(cfg.data.action.num_actions), source="action", target="action", ))
+  action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))
 
-    dataset.transform = (dt.transforms.Compose(image_transform, action_transform, ))
+  dataset.transform = (dt.transforms.Compose(grid_transform, action_transform, ))
 
-    action_input_dim = (cfg.data.frameskip * cfg.data.action.num_actions)
-
-  elif cfg.data.type == "arc":
-    grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))
-
-    action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))
-
-    dataset.transform = (dt.transforms.Compose(grid_transform, action_transform, ))
-
-    action_input_dim = 9
-
-  else:
-    raise ValueError(f"Unknown data type: {cfg.data.type}")
+  action_input_dim = 9  # 7 action one-hot + x + y
 
   with open_dict(cfg):
     cfg.model.action_encoder.input_dim = (action_input_dim)
@@ -405,9 +339,6 @@ def build_dataloaders(dataset, cfg: DictConfig):
   sampling_cfg = cfg.get("sampling")
 
   if sampling_cfg is not None:
-    if cfg.data.type != "arc":
-      raise ValueError("This balanced sampler currently supports ARC only")
-
     sampler = build_arc_sampler(dataset=dataset, train_indices=window_groups[0], success_probability_sampling=sampling_cfg.success_probability_sampling, seed=int(cfg.seed) + 1, )
 
     train_loader_cfg = dict(loader_cfg)
@@ -423,7 +354,8 @@ def build_dataloaders(dataset, cfg: DictConfig):
   eval_loader_cfg["shuffle"] = False
   eval_loader_cfg["drop_last"] = False
 
-  val_loader = torch.utils.data.DataLoader(val_set, **eval_loader_cfg)
+  # Shuffled so each batch mixes episodes; otherwise batch statistics (SIGReg, batch_latent_std) are inflated by consecutive windows of one episode.
+  val_loader = torch.utils.data.DataLoader(val_set, **{**eval_loader_cfg, "shuffle": True}, generator=generator, )
   test_loader = torch.utils.data.DataLoader(test_set, **eval_loader_cfg)
 
   return train_loader, val_loader, test_loader
@@ -433,9 +365,7 @@ def build_dataloaders(dataset, cfg: DictConfig):
 def main(cfg: DictConfig) -> None:
   pl.seed_everything(cfg.seed, workers=True, )
   if "run_name" not in cfg:
-    raise ValueError("No training experiment selected. "
-                     "Use --config-name train/pong_lewm "
-                     "or --config-name train/arc_lewm.")
+    raise ValueError("No training experiment selected. Use --config-name train/arc_lewm.")
 
   dataset = build_dataset(cfg)
 

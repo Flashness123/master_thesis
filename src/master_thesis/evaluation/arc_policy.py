@@ -10,7 +10,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class LevelEvaluation(BaseCallback):
-  """Evaluate direct-start success separately for each enabled level."""
+  """PPO evaluatio direct-start success separately for each enabled level."""
 
   def __init__(self, env, levels, output_path: Path, every_steps: int = 20_480, episodes_per_level: int = 10, seed: int = 100_000, ):
     super().__init__()
