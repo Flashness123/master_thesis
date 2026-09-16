@@ -9,14 +9,14 @@ import numpy as np
 import torch
 
 from gymnasium import spaces
+from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
-from stable_worldmodel.wm.utils import load_pretrained
 
-from master_thesis.environments.arc_collection import get_stablewm_home
 from master_thesis.environments.arc_ppo import ArcPPOEnv
+from master_thesis.paths import model_dir, timestamp
 from master_thesis.evaluation.arc_policy import LevelEvaluation
 from master_thesis.training.lewm import ArcGridToPixels
 
@@ -83,7 +83,7 @@ def main():
   parser = argparse.ArgumentParser(description="Train PPO on ARC images or frozen LeWM embeddings")
 
   parser.add_argument("--input", choices=["images", "lewm"], required=True, )
-  parser.add_argument("--run-name", required=True)
+  parser.add_argument("--run-name", required=True, help="Run name without timestamp, e.g. ls20_lewm-l1_l1; saved as models/ppo/<run-name>_<MMDD-HHMM>")
   parser.add_argument("--game", default="ls20-9607627b")
   parser.add_argument("--levels", nargs="+", type=int, default=None)
   parser.add_argument("--seed", type=int, default=42)
@@ -93,8 +93,7 @@ def main():
   parser.add_argument("--eval-every", type=int, default=20_480)
   parser.add_argument("--eval-episodes", type=int, default=10)
   parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", )
-  parser.add_argument("--lewm-run", default=None)
-  parser.add_argument("--lewm-weights", default="weights.pt")
+  parser.add_argument("--lewm-run", default=None, help="LeWM model folder name under models/lewm")
 
   args = parser.parse_args()
 
@@ -121,24 +120,27 @@ def main():
 
   set_random_seed(args.seed, using_cuda=device == "cuda", )
 
-  home = get_stablewm_home()
   lewm = None
   img_size = 224
 
   if args.input == "lewm":
-    training_config = OmegaConf.load(home / "runs" / args.lewm_run / "config.yaml")
+    lewm_dir = model_dir("lewm", args.lewm_run)  # models/lewm/<lewm_run>
+    training_config = OmegaConf.load(lewm_dir / "train_config.yaml")  # full LeWM training config
 
     if training_config.data.type != "arc":
       raise ValueError("The selected LeWM run was not configured for ARC")
 
     img_size = int(training_config.img_size)
 
-    lewm = load_pretrained(f"{args.lewm_run}/{args.lewm_weights}", cache_dir=str(home), )
+    model_config = json.loads((lewm_dir / "model_config.json").read_text(encoding="utf-8"))  # architecture with _target_ entries
+    lewm = instantiate(model_config)  # build JEPA with random weights (Hydra, as in lewm.py)
+    lewm.load_state_dict(torch.load(lewm_dir / "weights.pt", map_location="cpu", weights_only=True), strict=True)  # then load the trained weights
 
     lewm.to(device).eval()
     lewm.requires_grad_(False)
 
-  run_dir = home / "runs" / args.run_name
+  run_name = f"{args.run_name}_{timestamp()}"  # e.g. ls20_lewm-l1_l1_0916-1432
+  run_dir = model_dir("ppo", run_name)  # models/ppo/<run_name>
 
   # Require a new run name to avoid mixing or overwriting experiments.
   run_dir.mkdir(parents=True, exist_ok=False)
@@ -152,9 +154,9 @@ def main():
   eval_env = ArcPolicyInput(ArcPPOEnv(game_id=args.game, seed=args.seed + 100_000, levels=levels, max_steps=args.max_steps, stop_on_success=True, ), history=args.history, lewm=lewm, img_size=img_size, )
 
   settings = vars(args).copy()
-  settings.update({"device": device, "levels": levels, "lewm_img_size": img_size if lewm is not None else None, })
+  settings.update({"run_name": run_name, "device": device, "levels": levels, "lewm_img_size": img_size if lewm is not None else None, })  # run_name with timestamp
 
-  (run_dir / "config.json").write_text(json.dumps(settings, indent=2), encoding="utf-8", )
+  (run_dir / "train_config.json").write_text(json.dumps(settings, indent=2), encoding="utf-8", )
 
   model = PPO("CnnPolicy" if args.input == "images" else "MlpPolicy", train_env, learning_rate=3e-4, n_steps=2048, batch_size=64, n_epochs=10, gamma=0.99, gae_lambda=0.95, clip_range=0.2, ent_coef=0.01, policy_kwargs={
     "net_arch": {

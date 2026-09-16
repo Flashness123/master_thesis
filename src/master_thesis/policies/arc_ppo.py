@@ -6,28 +6,28 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 from arcengine import GameAction
 from stable_baselines3 import PPO
 from stable_baselines3.common.utils import set_random_seed
 
+from master_thesis.paths import model_dir
 from master_thesis.training.lewm import ArcGridToPixels
 
 
 class ArcImagePPOPolicy:
-  """Use a frozen image-PPO checkpoint through the ARC policy interface."""
+  """Use a frozen image-PPO run (models/ppo/<run_name>) through the ARC policy interface."""
 
-  def __init__(self, checkpoint: str | Path, device: str = "auto"):
-    checkpoint = Path(checkpoint)
+  def __init__(self, run_name: str, device: str = "auto"):
+    run_dir = model_dir("ppo", run_name)  # e.g. models/ppo/ls20_images_l1-7_0914-1220
 
-    self.settings = json.loads((checkpoint.parent / "config.json").read_text(encoding="utf-8"))
+    self.settings = json.loads((run_dir / "train_config.json").read_text(encoding="utf-8"))  # settings written by training/ppo.py
 
     if self.settings["input"] != "images":
-      raise ValueError("Expected an image-PPO checkpoint")
+      raise ValueError("Expected an image-PPO run")
 
-    self.model = PPO.load(str(checkpoint), device=device)
+    self.model = PPO.load(str(run_dir / "policy.zip"), device=device)  # SB3 policy weights + hyperparameters
     self.model.policy.set_training_mode(False)
     self.model.policy.requires_grad_(False)
 

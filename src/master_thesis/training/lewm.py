@@ -1,4 +1,4 @@
-import os
+import json
 import hydra
 import lightning as pl
 import stable_pretraining as spt
@@ -6,17 +6,18 @@ import stable_worldmodel as swm
 import torch
 import torch.nn.functional as F
 
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf, open_dict
 from stable_pretraining import data as dt
-from stable_worldmodel.wm.utils import save_pretrained
 from functools import partial
 from pathlib import Path
 from master_thesis.models.lewm import SIGReg
+from master_thesis.paths import model_dir, timestamp
 from lightning.pytorch.loggers import TensorBoardLogger
 from master_thesis.evaluation.world_model_metrics import world_model_metrics
 
 
-class DiscreteActionOneHot:
+class DiscreteActionOneHot:  # PONG ONLY: action IDs → flattened one-hot vectors
   """
     Convert temporally grouped discrete action IDs to one-hot vectors.
 
@@ -58,7 +59,7 @@ class DiscreteActionOneHot:
     return one_hot.flatten(start_dim=-2)
 
 
-class ArcGridToPixels:
+class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image for the ViT
   """
   Convert an ARC-AGI-3 categorical 64x64 grid into RGB pixels for
   vanilla LeWM's existing 3-channel ViT encoder.
@@ -93,15 +94,14 @@ class ArcGridToPixels:
       dtype=torch.float32,
     ) / 255.0
 
-    self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, ).view(1, 3, 1, 1)
+    self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel mean, shaped to broadcast over [T, 3, H, W]
 
-    self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, ).view(1, 3, 1, 1)
+    self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel std (conventional for ViTs; the ViT isn't pretrained here, so it's just a fixed scaling)
 
-  def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:
+  def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:  # grids: [T, 4096] float32 from Lance (T = 4 in training, 1 in ppo.py)
 
     if grids.shape[-1] != 64 * 64:
-      raise ValueError(f"Expected flattened ARC grids with 4096 values, "
-                       f"got shape {tuple(grids.shape)}")
+      raise ValueError(f"Expected flattened ARC grids with 4096 values, got shape {tuple(grids.shape)}")
 
     grids = grids.long().reshape(-1, 64, 64, )
 
@@ -122,10 +122,10 @@ class ArcGridToPixels:
     mean = self.mean.to(pixels.device)
     std = self.std.to(pixels.device)
 
-    return (pixels - mean) / std
+    return (pixels - mean) / std  # normalized [T, 3, 224, 224]
 
 
-class ArcActionEncoding:
+class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (the same logic as encode_arc_action in arc_recording.py, written a second time)
   """
   Convert canonical ARC actions:
 
@@ -178,7 +178,7 @@ class ArcActionEncoding:
     return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )
 
 
-def build_image_transform(img_size: int):
+def build_image_transform(img_size: int):  # PONG ONLY: image preprocessing for real RGB frames
   """
     LeWM image preprocessing:
     uint8 RGB -> float -> ImageNet normalization -> square resize.
@@ -192,7 +192,7 @@ def build_image_transform(img_size: int):
   return dt.transforms.Compose(to_image, resize, )
 
 
-def build_dataset(cfg: DictConfig):
+def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows and attaches the transforms
   dataset_name = cfg.data.name
 
   dataset = swm.data.load_dataset(dataset_name, transform=None, frameskip=cfg.data.frameskip, num_steps=(cfg.wm.history_size + cfg.wm.num_preds), keys_to_load=list(cfg.data.keys_to_load), )
@@ -453,7 +453,7 @@ def main(cfg: DictConfig) -> None:
   if init_weights:
     checkpoint = Path(init_weights)
 
-    saved_model_config = OmegaConf.load(checkpoint.parent / "config.json")
+    saved_model_config = OmegaConf.load(checkpoint.parent / "model_config.json")  # architecture saved next to weights.pt
 
     if (OmegaConf.to_container(saved_model_config, resolve=True) != OmegaConf.to_container(cfg.model, resolve=True)):
       raise ValueError("Current model configuration differs from the source checkpoint")
@@ -477,17 +477,16 @@ def main(cfg: DictConfig) -> None:
 
   data_module = spt.data.DataModule(train=train_loader, val=val_loader, )
 
-  stablewm_home = Path(os.environ["STABLEWM_HOME"])
+  run_name = f"{cfg.run_name}_{timestamp()}"  # description from the config/command line + MMDD-HHMM
+  run_dir = model_dir("lewm", run_name)  # models/lewm/<run_name>: weights, configs and logs of this run
 
-  run_dir = stablewm_home / "runs" / cfg.run_name
-  checkpoint_dir = stablewm_home / "checkpoints" / cfg.run_name
+  run_dir.mkdir(parents=True, exist_ok=False)  # fails if this name already exists
 
-  if run_dir.exists() or checkpoint_dir.exists():
-    raise FileExistsError(f"Run {cfg.run_name!r} already exists. Choose a new run_name.")
+  with open_dict(cfg):
+    cfg.run_name = run_name  # store the final folder name in the saved config
 
-  run_dir.mkdir(parents=True, exist_ok=False)
-
-  OmegaConf.save(cfg, run_dir / "config.yaml", )
+  OmegaConf.save(cfg, run_dir / "train_config.yaml", )  # full training config (interpolations unresolved)
+  OmegaConf.save(OmegaConf.create(list(HydraConfig.get().overrides.task)), run_dir / "hydra_overrides.yaml")  # exactly what was typed on the command line
 
   logger = TensorBoardLogger(save_dir=str(run_dir), name="tensorboard", default_hp_metric=False, )
 
@@ -497,7 +496,8 @@ def main(cfg: DictConfig) -> None:
 
   manager()
 
-  save_pretrained(model, run_name=cfg.run_name, config=cfg.model, filename="weights.pt", )
+  torch.save(model.state_dict(), run_dir / "weights.pt")  # final weights (no optimizer state)
+  (run_dir / "model_config.json").write_text(json.dumps(OmegaConf.to_container(cfg.model, resolve=True), indent=2), encoding="utf-8")  # architecture needed to rebuild the model (ppo.py, init_weights)
 
 
 if __name__ == "__main__":

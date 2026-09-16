@@ -62,21 +62,31 @@ action encoder
 predictor
 prediction projector
 
-How to use:
-uv run python -m master_thesis.training.lewm --config-name train/arc_lewm trainer.max_epochs=1 # the trainer.max_epochs=1 are direct edits in the config
+Storage layout ($STABLEWM_HOME, see src/master_thesis/paths.py):
+recordings/<game>/<collection>_<MMDD-HHMM>/   datasets/<game>/<dataset>.lance   models/lewm|ppo/<run>_<MMDD-HHMM>/
 
+How to run:
+Collect recordings (one collection folder with level_1 ... level_7):
+uv run python -m master_thesis.environments.arc_collection ls20-9607627b \
+  --mode offline --policy goose --start-levels 1 2 3 4 5 6 7 --runs 100 --max-steps 500 --seed 42
 
+Convert a collection into datasets/ls20/<dataset>.lance:
+uv run python -m master_thesis.environments.arc_recording \
+  "$STABLEWM_HOME/recordings/ls20/goose_l1-7_0913-2346" --dataset goose_l1-7
 
+LeWM training (saved to models/lewm/<run_name>_<MMDD-HHMM>):
+uv run python -m master_thesis.training.lewm --config-name train/arc_lewm \
+  data.dataset=goose_l1-7 run_name=ls20_goose-l1-7_10ep trainer.max_epochs=10 \
+  loader.batch_size=32 loader.num_workers=2 sampling.success_probability_sampling=0.2
+  (continue from a model: ++init_weights=$STABLEWM_HOME/models/lewm/<run>/weights.pt)
 
 ++++++++++++++++++++++++++++++
-How to run:
-PPO training on lewm:
+PPO training on lewm (saved to models/ppo/<run-name>_<MMDD-HHMM>):
 uv run python -m master_thesis.training.ppo \
   --input lewm \
-  --lewm-run "arc/ls20_3060ti_20260913_234616/lewm_ppo_round1" \
-  --lewm-weights weights.pt \
+  --lewm-run ls20_goose-ppo-l1_ft130ep_0914-2034 \
   --game ls20-9607627b \
-  --run-name "arc/ls20_3060ti_20260913_234616/ppo_lewm_round1_$(date +%Y%m%d_%H%M%S)" \
+  --run-name ls20_lewm-l1_l1 \
   --steps 204800 \
   --max-steps 500 \
   --history 3 \

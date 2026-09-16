@@ -9,7 +9,8 @@ from arc_agi.local_wrapper import LocalEnvironmentWrapper
 from arcengine import GameAction, GameState
 from gymnasium import spaces
 
-from master_thesis.environments.arc_collection import (get_stablewm_home, reset_at_level, )
+from master_thesis.environments.arc_collection import reset_at_level
+from master_thesis.paths import arc_environments_dir
 
 
 class ArcPPOEnv(gym.Env):
@@ -21,7 +22,7 @@ class ArcPPOEnv(gym.Env):
     if max_steps < 1:
       raise ValueError("max_steps must be positive")
 
-    self.arcade = arc_agi.Arcade(operation_mode=OperationMode.OFFLINE, environments_dir=str(get_stablewm_home() / "arc_environments"), )
+    self.arcade = arc_agi.Arcade(operation_mode=OperationMode.OFFLINE, environments_dir=str(arc_environments_dir()), )  # $STABLEWM_HOME/arc_environments
 
     self.arc = self.arcade.make(game_id, seed=seed, include_frame_data=True, )
 

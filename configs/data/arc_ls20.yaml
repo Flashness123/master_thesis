@@ -1,6 +1,7 @@
 type: arc
-id: ls20 # identifier for paths
-name: ${oc.env:STABLEWM_HOME}/datasets/arc_ls20.lance
+game: ls20  # game folder under $STABLEWM_HOME/datasets/
+dataset: goose_l1-7  # dataset name without .lance; choose another with data.dataset=goose-ppo_l1_cut
+name: ${oc.env:STABLEWM_HOME}/datasets/${data.game}/${data.dataset}.lance  # full Lance path, built from game + dataset
 num_steps: ${eval:'${wm.history_size} + ${wm.num_preds}'}  # history_size=3 + num_preds=1 -> four ARC states.
 frameskip: 1  # One ARC action already represents one meaningful environment transition.
 keys_to_load:

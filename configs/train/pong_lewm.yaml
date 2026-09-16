@@ -4,9 +4,15 @@
 defaults:  # create one big env out of this + lewm.yaml + pong_onehot
   - /data: pong_onehot
   - /model: lewm
+  - override /hydra/job_logging: stdout  # log to the terminal only (no lewm.log file)
   - _self_
 
-run_name: pong/lewm
+run_name: pong_random  # description only; lewm.py saves to models/lewm/<run_name>_<MMDD-HHMM>
+
+hydra:
+  output_subdir: null  # no .hydra/ folder; lewm.py saves train_config.yaml + hydra_overrides.yaml into the model folder
+  run:
+    dir: .  # no outputs/<date>/<time>/ folder
 seed: 3072
 train_split: 0.8
 val_split: 0.1

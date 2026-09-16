@@ -1,3 +1,12 @@
+defaults:
+  - override hydra/job_logging: stdout  # log to the terminal only (no log file)
+  - _self_
+
+hydra:
+  output_subdir: null  # no .hydra/ folder
+  run:
+    dir: .  # no outputs/<date>/<time>/ folder
+
 world:
   env_name: ALE/Pong-v5  # Which gymnasium env to create
   num_envs: 1  # SWM can vectorize environments
@@ -13,7 +22,7 @@ policy:
   seed: 42  # seed for the random policy
 
 collection:
-  path: ${oc.env:STABLEWM_HOME}/datasets/pong_random.lance  # dataset path
+  path: ${oc.env:STABLEWM_HOME}/datasets/pong/random.lance  # dataset path
   episodes: 100
   seed: 42  # seed for the gym env
   format: lance  # ml table format like: episode_idx | step_idx | pixels | action | reward |  - cosnumed like a dictionary
