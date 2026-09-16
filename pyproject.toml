@@ -37,15 +37,21 @@ authors = [
 ]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "anywidget>=0.11.0",
     "arc-agi>=0.9.9",
     "einops==0.8.2",
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.9",
     "matplotlib>=3.10.9",
+    "nbformat>=5.11.1",
     "pillow>=12.3.0",
+    "plotly>=7.1.0",
     "stable-pretraining==0.1.8",
     "stable-worldmodel[env,format,train]==0.1.1",
     "tensorboard>=2.21.0",
     "torch==2.14.0",
     "torchvision==0.29.0",
+    "umap-learn>=0.5.12",
 ]
 
 [project.scripts]
