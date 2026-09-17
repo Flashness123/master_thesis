@@ -1,3 +1,4 @@
+import os
 import json
 import hydra
 import lightning as pl
@@ -489,6 +490,12 @@ def main(cfg: DictConfig) -> None:
   manager()
 
   torch.save(model.state_dict(), run_dir / "weights.pt")  # final weights (no optimizer state)
+
+  # Everything is written; end the process immediately. Otherwise the persistent dataloader workers keep it
+  # alive after training (on SLURM the job then runs into its time limit instead of finishing).
+  logger.save()  # flush the TensorBoard events first, os._exit skips all cleanup
+  print(f"Training complete: {run_dir}")
+  os._exit(0)
 
 
 if __name__ == "__main__":
