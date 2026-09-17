@@ -353,12 +353,14 @@ def recording_files(source: Path) -> list[Path]:  # one .jsonl file, or every .j
     return files
 
 
-def iter_episodes(files: list[Path]) -> Iterable[dict[str, list]]:  # yields Lance episodes file by file (only one file in memory)
+def iter_episodes(files: list[Path], levels: list[int] | None = None) -> Iterable[dict[str, list]]:  # yields Lance episodes file by file (only one file in memory)
     for file in files:
-        yield from build_lance_episodes(build_transitions(load_recording(file)))  # converted per file, so episodes of different files never merge
+        for episode in build_lance_episodes(build_transitions(load_recording(file))):  # converted per file, so episodes of different files never merge
+            if levels is None or episode["start_level"][0] in levels:  # keep only episodes that play one of the requested levels
+                yield episode
 
 
-def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | Path, mode: str = "error", sources: list[Path] = (), ) -> None:
+def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | Path, mode: str = "error", sources: list[Path] = (), levels: list[int] | None = None, ) -> None:
     """
   Write ARC episodes using stable-worldmodel's native Lance writer
   and record where they came from in <dataset>.json next to the table.
@@ -383,7 +385,7 @@ def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | 
 
     record_path = output_path.with_suffix(".json")  # datasets/<game>/<dataset>.json
     record = json.loads(record_path.read_text(encoding="utf-8")) if mode == "append" and record_path.exists() else {"writes": []}  # appending keeps the earlier history
-    record["writes"].append({"time": datetime.now().isoformat(timespec="seconds"), "mode": mode, "sources": [str(Path(source).resolve()) for source in sources], **counts})  # one entry per write
+    record["writes"].append({"time": datetime.now().isoformat(timespec="seconds"), "mode": mode, "sources": [str(Path(source).resolve()) for source in sources], "levels": levels, **counts})  # one entry per write; levels = level filter (None = all)
     record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
     print(f"\nWrote Lance dataset: {output_path}")
@@ -397,6 +399,7 @@ def main() -> None:
     parser.add_argument("--show", type=int, default=5, help="number of transitions of the first file to print")
     parser.add_argument("--dataset", default=None, help="write datasets/<game>/<DATASET>.lance, e.g. goose_l1-7")
     parser.add_argument("--mode", choices=["error", "append", "overwrite", ], default="error", help="what to do if the dataset already exists")
+    parser.add_argument("--levels", type=int, nargs="+", default=None, help="keep only episodes of these levels, e.g. --levels 1 (default: all)")
     args = parser.parse_args()
 
     files = recording_files(args.recording)
@@ -429,7 +432,7 @@ def main() -> None:
 
     if args.dataset is not None:
         game_id = str(events[0]["data"]["game_id"])  # e.g. "ls20-9607627b" -> stored under datasets/ls20/
-        write_lance_dataset(iter_episodes(files), dataset_path(game_id, args.dataset), mode=args.mode, sources=[args.recording], )
+        write_lance_dataset(iter_episodes(files, args.levels), dataset_path(game_id, args.dataset), mode=args.mode, sources=[args.recording], levels=args.levels, )
 
 
 if __name__ == "__main__":

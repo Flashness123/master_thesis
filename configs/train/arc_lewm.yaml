@@ -13,6 +13,17 @@ hydra:
   run:
     dir: .  # no outputs/<date>/<time>/ folder
 seed: 3072
+checkpoint_every_steps: 10000  # save checkpoints/step<N>.ckpt (full state) + weights_step<N>.pt; null = only the final weights
+
+planning:  # plan in the real ARC game during training (evaluation/arc_policies.py); every_steps: null = off
+  every_steps: null
+  dataset: human_l1-7  # goal states come from these recorded episodes
+  goal_steps: [5, 10, 25]  # how many steps after an episode start the goal lies
+  levels: null  # levels to evaluate (null = all levels in the dataset)
+  episodes_per_level: 1
+  samples: 200  # action sequences per CEM round
+  iterations: 5  # CEM rounds per planned step
+# run length in steps instead of epochs: trainer.max_steps=150000 trainer.max_epochs=-1
 train_split: 0.8
 val_split: 0.1
 img_size: 224
@@ -26,6 +37,9 @@ wm:
 
 trainer:
   max_epochs: 100
+  max_steps: -1  # -1 = run for max_epochs; set e.g. 150000 together with max_epochs=-1
+  check_val_every_n_epoch: 1  # validation frequency
+  enable_checkpointing: false  # no Lightning default checkpoint (rewritten every epoch); lewm.py saves its own every checkpoint_every_steps
   accelerator: gpu
   devices: 1
   precision: bf16-mixed

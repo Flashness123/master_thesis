@@ -12,9 +12,51 @@ from stable_pretraining import data as dt
 from functools import partial
 from pathlib import Path
 from master_thesis.models.lewm import SIGReg
-from master_thesis.paths import model_dir, timestamp
+from master_thesis.paths import model_dir, stablewm_home, timestamp
+from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import TensorBoardLogger
 from master_thesis.evaluation.world_model_metrics import world_model_metrics
+
+
+class PlanningEvaluation(Callback):
+  """Every `every_steps` optimizer steps: plan in the real ARC game towards goal states and log planning/* (see evaluation/arc_policies.py)."""
+
+  def __init__(self, model, folder: Path, every_steps: int, settings: dict):
+    self.model = model  # the JEPA (not the spt.Module wrapper)
+    self.folder = folder  # models/lewm/<run>/planning: GIFs per evaluation
+    self.every_steps = every_steps
+    self.settings = settings  # dataset, goal_steps, episodes_per_level, ... from the config
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    step = trainer.global_step
+    if step == 0 or step % self.every_steps:
+      return
+
+    from master_thesis.evaluation.arc_policies import evaluate_planning  # imported here so training does not depend on the ARC game
+    from master_thesis.evaluation.world_model_metrics import planning_metrics
+
+    was_training = self.model.training
+    self.model.eval()  # planning must be deterministic (the predictor has dropout)
+    rows = evaluate_planning(self.model, gif_dir=self.folder / f"step{step}", device=str(pl_module.device), **self.settings)
+    self.model.train(was_training)
+
+    metrics = {name: value for name, value in planning_metrics(rows).items() if value == value}  # drop NaN (e.g. no distance measured)
+    pl_module.log_dict(metrics, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard
+
+
+class SaveCheckpointEvery(Callback):
+  """Every `every_steps` optimizer steps, save a full checkpoint (resumable) and the plain model weights."""
+
+  def __init__(self, model, folder: Path, every_steps: int):
+    self.model = model  # the JEPA (not the spt.Module wrapper)
+    self.folder = folder  # models/lewm/<run>/checkpoints
+    self.every_steps = every_steps
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    step = trainer.global_step  # optimizer steps done so far (one per batch)
+    if step > 0 and step % self.every_steps == 0:
+      trainer.save_checkpoint(self.folder / f"step{step}.ckpt")  # model, optimizer, lr schedule, step counter (for resuming later)
+      torch.save(self.model.state_dict(), self.folder / f"weights_step{step}.pt")  # loadable like weights.pt
 
 
 class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image for the ViT
@@ -192,11 +234,12 @@ def lewm_forward(self, batch, stage, cfg, ):
 
   loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss)
 
-  self.log_dict({f"{stage}/loss": loss.detach(), f"{stage}/pred_loss": prediction_loss.detach(), f"{stage}/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=True, sync_dist=True, )
+  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps)
+    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
 
-  if not self.training:
+  else:  # validation: one value per epoch
     metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
-    self.log_dict({f"{stage}/{name}": value for name, value in metrics.items()}, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )
+    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )
 
   return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
 
@@ -393,7 +436,8 @@ def main(cfg: DictConfig) -> None:
     model.load_state_dict(state_dict, strict=True)
     print(f"Initialized LeWM from: {checkpoint}")
 
-  total_steps = (cfg.trainer.max_epochs * len(train_loader))
+  max_steps = cfg.trainer.get("max_steps") or -1  # if set (> 0), the run length is given in optimizer steps (use with trainer.max_epochs=-1)
+  total_steps = max_steps if max_steps > 0 else cfg.trainer.max_epochs * len(train_loader)  # length of the learning-rate schedule
 
   if total_steps < 2:
     raise ValueError("LeWM training needs at least 2 optimizer steps "
@@ -417,17 +461,34 @@ def main(cfg: DictConfig) -> None:
 
   OmegaConf.save(cfg, run_dir / "train_config.yaml", )  # full training config (interpolations unresolved)
   OmegaConf.save(OmegaConf.create(list(HydraConfig.get().overrides.task)), run_dir / "hydra_overrides.yaml")  # exactly what was typed on the command line
+  (run_dir / "model_config.json").write_text(json.dumps(OmegaConf.to_container(cfg.model, resolve=True), indent=2), encoding="utf-8")  # architecture needed to rebuild the model (ppo.py, init_weights); written first so intermediate weights are usable
 
   logger = TensorBoardLogger(save_dir=str(run_dir), name="tensorboard", default_hp_metric=False, )
 
-  trainer = pl.Trainer(**cfg.trainer, default_root_dir=run_dir, logger=logger, )
+  # stable-pretraining always has a cache folder (default ~/.cache/stable-pretraining) where it writes its own last.ckpt after every epoch:
+  # keep it inside the data root and switch that per-epoch checkpoint off (we save our own below)
+  spt.set(cache_dir=str(stablewm_home() / "spt_cache"), requeue_checkpoint=False)
+
+  callbacks = []
+  every_steps = cfg.get("checkpoint_every_steps")  # e.g. 10000; None/0 = only the final weights
+  if every_steps:
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir()
+    callbacks.append(SaveCheckpointEvery(model, checkpoint_dir, every_steps))  # -> checkpoints/step10000.ckpt + weights_step10000.pt
+
+  planning_cfg = cfg.get("planning")  # optional: plan in the real ARC game during training
+  if planning_cfg and planning_cfg.get("every_steps"):
+    settings = {key: value for key, value in OmegaConf.to_container(planning_cfg, resolve=True).items() if key != "every_steps"}  # dataset, goal_steps, episodes_per_level, ...
+    callbacks.append(PlanningEvaluation(model, run_dir / "planning", planning_cfg.every_steps, settings))
+
+  trainer = pl.Trainer(**cfg.trainer, default_root_dir=run_dir, logger=logger, callbacks=callbacks, )
+  trainer.callbacks = [callback for callback in trainer.callbacks if type(callback).__name__ != "HardwareMonitor"]  # drop stable-pretraining's hardware/* curves (CPU, RAM, disk, network)
 
   manager = spt.Manager(trainer=trainer, module=module, data=data_module, )
 
   manager()
 
   torch.save(model.state_dict(), run_dir / "weights.pt")  # final weights (no optimizer state)
-  (run_dir / "model_config.json").write_text(json.dumps(OmegaConf.to_container(cfg.model, resolve=True), indent=2), encoding="utf-8")  # architecture needed to rebuild the model (ppo.py, init_weights)
 
 
 if __name__ == "__main__":

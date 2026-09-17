@@ -158,6 +158,21 @@ from master_thesis.evaluation.arc_dataset_metric_visualization import save_episo
 save_episode_gifs("ls20", "ppo-images_l1-7_v2", 3, level=1, success=False, seed=0)
 
 
+3b. Planning with a trained LeWM (CEM in the real game)
+------------------------------------------------------------------------------
+Goal states come from recorded episodes (5/10/25 steps after an episode start); CEM plans with LeWM's
+own latent rollout, the best first action is played in the real game (model-predictive control).
+Output: evaluation/<game>/<run>_planning.json + <run>_planning/*.gif (played game | goal).
+
+uv run python -m master_thesis.evaluation.arc_policies \
+  --lewm-run ls20_goose-ppo-l1_ft130ep_0914-2034 --dataset human_l1-7 \
+  --goal-steps 5 10 25 --levels 1 --episodes 2 --samples 300 --iterations 10
+  (--weights checkpoints/weights_step30000.pt evaluates an intermediate checkpoint)
+  (--tensorboard --step 30000 also writes planning/* into that run's TensorBoard)
+
+During training: planning.every_steps=10000 in the LeWM config (off by default), GIFs land in
+models/lewm/<run>/planning/step<N>/.
+
 4. Train LeWM
 ------------------------------------------------------------------------------
 Config: configs/train/arc_lewm.yaml (+ configs/data/arc_ls20.yaml, configs/model/lewm.yaml).

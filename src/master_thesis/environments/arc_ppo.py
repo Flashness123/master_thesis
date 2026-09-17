@@ -52,6 +52,11 @@ class ArcPPOEnv(gym.Env):
     self.stop_on_success = stop_on_success
     self.finished = True
 
+  @property
+  def grid(self):
+    """Current 64x64 ARC grid, also for wrappers whose observation is not the grid (images, LeWM embeddings)."""
+    return self._grid()
+
   def _grid(self):
     grid = np.asarray(self.observation.frame[-1])
 

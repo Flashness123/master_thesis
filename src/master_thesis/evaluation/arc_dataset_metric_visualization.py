@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import csv
+from pathlib import Path
 
 import matplotlib
 
@@ -39,6 +40,34 @@ def load_columns(game: str, dataset_name: str):
   return grids, actions, levels, successes, episodes  # the reader itself (with its float32 copies) is dropped here to save memory
 
 
+def grids_to_gif(grids, path, labels=None, side_grid=None, scale: int = 8, duration: int = 150):
+  """
+  Write ARC grids as a GIF (also used by the planning evaluation).
+
+  grids:     [frames, 4096] or [frames, 64, 64] colour indices
+  labels:    optional one text per frame, drawn top left
+  side_grid: optional single grid shown to the right of every frame (e.g. the planning goal)
+  """
+  palette = (ArcGridToPixels(64).palette.numpy() * 255).round().astype(np.uint8)  # [16, 3] colour index -> RGB
+  side = Image.fromarray(palette[np.asarray(side_grid).reshape(64, 64)]).resize((64 * scale, 64 * scale), Image.NEAREST) if side_grid is not None else None
+
+  frames = []
+  for index, grid in enumerate(grids):
+    frame = Image.fromarray(palette[np.asarray(grid).reshape(64, 64)]).resize((64 * scale, 64 * scale), Image.NEAREST)  # enlarge without blending colours
+    if side is not None:  # place the two images next to each other with a small gap
+      both = Image.new("RGB", (frame.width * 2 + 8, frame.height), "black")
+      both.paste(frame, (0, 0))
+      both.paste(side, (frame.width + 8, 0))
+      frame = both
+    if labels is not None:
+      ImageDraw.Draw(frame).text((4, 4), labels[index], fill=(255, 0, 255))  # magenta text, top left
+    frames.append(frame)
+
+  Path(path).parent.mkdir(parents=True, exist_ok=True)
+  frames[0].save(path, save_all=True, append_images=frames[1:], duration=duration, loop=0)  # duration ms per frame, repeat forever
+  return path
+
+
 def save_episode_gifs(game: str, dataset_name: str, count: int, level: int | None = None, success: bool | None = None, seed: int = 0, scale: int = 8, columns=None):
   """
   Save `count` randomly chosen episodes as GIFs to evaluation/<game>/<dataset_name>_gifs/.
@@ -48,22 +77,14 @@ def save_episode_gifs(game: str, dataset_name: str, count: int, level: int | Non
   candidates = [index for index, (start, _) in enumerate(episodes) if (level is None or levels[start] == level) and (success is None or successes[start] == success)]  # episodes matching the filter
   chosen = np.random.default_rng(seed).choice(candidates, size=min(count, len(candidates)), replace=False)  # same seed -> same episodes
 
-  palette = (ArcGridToPixels(64).palette.numpy() * 255).round().astype(np.uint8)  # [16, 3] colour index -> RGB
   output_dir = evaluation_dir(game) / f"{dataset_name}_gifs"
-  output_dir.mkdir(parents=True, exist_ok=True)
 
   for index in chosen:
     start, length = episodes[index]
-    frames = []
-    for step in range(length):
-      rgb = palette[grids[start + step].reshape(64, 64)]  # [64, 64, 3] image of this state
-      frame = Image.fromarray(rgb).resize((64 * scale, 64 * scale), Image.NEAREST)  # enlarge without blending colours
-      label = f"step {step}  action {actions[start + step]}" if step < length - 1 else f"step {step}  end"  # action taken in this state (the last state has none)
-      ImageDraw.Draw(frame).text((4, 4), label, fill=(255, 0, 255))  # magenta text, top left
-      frames.append(frame)
+    labels = [f"step {step}  action {actions[start + step]}" if step < length - 1 else f"step {step}  end" for step in range(length)]  # action taken in this state (the last state has none)
     outcome = "success" if successes[start] else "fail"
     path = output_dir / f"{dataset_name}_level{levels[start]}_episode{index}_{outcome}.gif"  # episode index = episode_idx in the dataset
-    frames[0].save(path, save_all=True, append_images=frames[1:], duration=150, loop=0)  # 150 ms per frame, repeat forever
+    grids_to_gif(grids[start:start + length], path, labels=labels, scale=scale)
     print(f"Saved {path}")
 
 
