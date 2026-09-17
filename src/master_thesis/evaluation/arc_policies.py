@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -28,7 +29,7 @@ class LewmRolloutPlanner:
   imagines where they lead, and the first action of the best sequence is played in the real game.
   """
 
-  def __init__(self, model, env, goal_grid, img_size: int = 224, horizon: int = 5, samples: int = 300, iterations: int = 10, topk: int = 30, device: str = "cuda", seed: int = 0, ignore_cells=None):
+  def __init__(self, model, env, goal_grid, img_size: int = 224, horizon: int = 5, samples: int = 300, iterations: int = 10, topk: int = 30, replan_every: int = 1, device: str = "cuda", seed: int = 0, ignore_cells=None):
     import gymnasium as gym
     from stable_worldmodel.planning.solver.categorical_cem import CategoricalCEMSolver
 
@@ -43,7 +44,9 @@ class LewmRolloutPlanner:
     self.goal_pixels = self._pixels(self.goal_grid)
     self.compare = ~ignore_cells if ignore_cells is not None else np.ones(self.goal_grid.size, dtype=bool)  # cells that decide "goal reached"
     self.dummy_action = torch.zeros(1, 1, ARC_ACTION_DIM, device=device)  # JEPA.get_cost expects an action entry; the rollout replaces it
-    self.distances = []  # the model's distance to the goal, one per planned step
+    self.distances = []  # the model's distance to the goal, one per plan
+    self.replan_every = min(replan_every, horizon)  # 1 = replan after every played action; horizon = play a whole plan (open loop)
+    self.queue = deque()  # actions of the current plan that are still to be played
 
     pad = lambda candidates: torch.nn.functional.pad(candidates, (0, ARC_ACTION_DIM - candidates.shape[-1]))  # one-hot over ACTION1..n -> 9-D LeWM action (x, y stay 0)
     cost = SimpleNamespace(get_cost=lambda info, candidates: model.get_cost(info, pad(candidates)))  # our JEPA is already the cost the solver expects
@@ -56,9 +59,11 @@ class LewmRolloutPlanner:
 
   @torch.no_grad()
   def choose_action(self, grid) -> int:
-    plan = self.solver.solve({"pixels": self._pixels(grid), "goal": self.goal_pixels, "action": self.dummy_action})  # CEM over action sequences
-    self.distances.append(float(plan["costs"][0]))  # elite mean cost of the last CEM round
-    return int(plan["actions"][0, 0, 0])  # first action of the best plan
+    if not self.queue:  # plan again only when the current plan is used up
+      plan = self.solver.solve({"pixels": self._pixels(grid), "goal": self.goal_pixels, "action": self.dummy_action})  # CEM over action sequences
+      self.distances.append(float(plan["costs"][0]))  # elite mean cost of the last CEM round
+      self.queue.extend(int(action) for action in plan["actions"][0, :self.replan_every, 0])  # play this many actions of the best plan
+    return self.queue.popleft()
 
   def stop(self, grid) -> bool:
     """Goal reached: every cell that is not ignored matches the goal."""
@@ -147,13 +152,13 @@ def evaluate_planning(model, game: str = "ls20", game_id: str = "ls20-9607627b",
         planner = LewmRolloutPlanner(model, env, grids[start + steps_ahead], ignore_cells=ignore, device=device, seed=seed, **planner_kwargs)
         played = run_episode(env, planner, max_steps=max_steps_factor * steps_ahead, record=True, options={"start_level": level})
 
-        row = {"level": level, "episode": index, "goal_steps": steps_ahead, "reached": played["stopped"], "steps": played["steps"], "final_distance": planner.distances[-1] if planner.distances else None}
+        row = {"level": level, "episode": index, "goal_steps": steps_ahead, "replan_every": planner.replan_every, "reached": played["stopped"], "steps": played["steps"], "final_distance": planner.distances[-1] if planner.distances else None}
         rows.append(row)
         print(", ".join(f"{key}={value}" for key, value in row.items()))
 
         if gif_dir is not None:
           labels = [f"step {step}" + (f"  action {played['actions'][step]}" if step < len(played["actions"]) else "  end") for step in range(len(played["grids"]))]
-          grids_to_gif(played["grids"], gif_dir / f"{dataset}_level{level}_episode{index}_goal{steps_ahead}_{'reached' if played['stopped'] else 'missed'}.gif", labels=labels, side_grid=grids[start + steps_ahead])
+          grids_to_gif(played["grids"], gif_dir / f"{dataset}_level{level}_episode{index}_goal{steps_ahead}_replan{planner.replan_every}_{'reached' if played['stopped'] else 'missed'}.gif", labels=labels, side_grid=grids[start + steps_ahead])
 
     env.close()
 
@@ -175,6 +180,7 @@ def main() -> None:
   parser.add_argument("--horizon", type=int, default=5, help="planning horizon in steps")
   parser.add_argument("--samples", type=int, default=300, help="action sequences per CEM round")
   parser.add_argument("--iterations", type=int, default=10, help="CEM rounds per step")
+  parser.add_argument("--replan-every", type=int, default=1, help="how many actions of a plan are played before replanning (1 = MPC, >= horizon = play the whole plan open loop)")
   parser.add_argument("--seed", type=int, default=0)
   parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
   parser.add_argument("--tensorboard", action="store_true", help="also write planning/* into the run's TensorBoard")
@@ -185,7 +191,7 @@ def main() -> None:
   model = load_lewm(args.lewm_run, weights=args.weights, device=device)
 
   gif_dir = evaluation_dir(args.game) / f"{args.lewm_run}_planning"
-  rows = evaluate_planning(model, game=args.game, game_id=args.game_id, dataset=args.dataset, goal_steps=args.goal_steps, levels=args.levels, episodes_per_level=args.episodes, gif_dir=gif_dir, device=device, seed=args.seed, horizon=args.horizon, samples=args.samples, iterations=args.iterations)
+  rows = evaluate_planning(model, game=args.game, game_id=args.game_id, dataset=args.dataset, goal_steps=args.goal_steps, levels=args.levels, episodes_per_level=args.episodes, gif_dir=gif_dir, device=device, seed=args.seed, horizon=args.horizon, samples=args.samples, iterations=args.iterations, replan_every=args.replan_every)
 
   output = evaluation_dir(args.game) / f"{args.lewm_run}_planning.json"
   output.write_text(json.dumps(rows, indent=2), encoding="utf-8")
