@@ -17,8 +17,10 @@ checkpoint_every_steps: 10000  # save checkpoints/step<N>.ckpt (full state) + we
 
 planning:  # plan in the real ARC game during training (evaluation/arc_policies.py); every_steps: null = off
   every_steps: null
-  dataset: human_l1-7  # goal states come from these recorded episodes
-  goal_steps: [5, 10, 25]  # how many steps after an episode start the goal lies
+  mode: goals  # goals: reach single goal states (planning/*); waypoints: complete levels along human solutions (waypoints/*)
+  dataset: human_l1-7  # goal states / solutions come from these recorded episodes
+  goal_steps: [5, 10, 25]  # goals mode: how many steps after an episode start the goal lies
+  waypoint_every: 5  # waypoints mode: every how many frames of the human solution a waypoint is placed
   levels: null  # levels to evaluate (null = all levels in the dataset)
   episodes_per_level: 1
   samples: 200  # action sequences per CEM round

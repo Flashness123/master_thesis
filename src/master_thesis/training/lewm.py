@@ -2,6 +2,7 @@ import os
 import json
 import hydra
 import lightning as pl
+import numpy as np
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
@@ -12,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from stable_pretraining import data as dt
 from functools import partial
 from pathlib import Path
+from PIL import Image, ImageSequence
 from master_thesis.models.lewm import SIGReg
 from master_thesis.paths import model_dir, stablewm_home, timestamp
 from lightning.pytorch.callbacks import Callback
@@ -20,29 +22,48 @@ from master_thesis.evaluation.world_model_metrics import world_model_metrics
 
 
 class PlanningEvaluation(Callback):
-  """Every `every_steps` optimizer steps: plan in the real ARC game towards goal states and log planning/* (see evaluation/arc_policies.py)."""
+  """
+  Every `every_steps` optimizer steps: play in the real ARC game with the current model (see evaluation/arc_policies.py).
+  mode "goals": reach single goal states, logs planning/*; mode "waypoints": complete levels along human solutions, logs waypoints/*.
+  The GIFs go to models/lewm/<run>/planning/step<N>/ and into TensorBoard (tab IMAGES).
+  """
 
   def __init__(self, model, folder: Path, every_steps: int, settings: dict):
     self.model = model  # the JEPA (not the spt.Module wrapper)
     self.folder = folder  # models/lewm/<run>/planning: GIFs per evaluation
     self.every_steps = every_steps
-    self.settings = settings  # dataset, goal_steps, episodes_per_level, ... from the config
+    self.mode = settings.pop("mode", "goals")
+    settings.pop("waypoint_every" if self.mode == "goals" else "goal_steps", None)  # the setting of the other mode is not an argument here
+    self.settings = settings  # dataset, levels, episodes_per_level, samples, ... from the config
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     step = trainer.global_step
     if step == 0 or step % self.every_steps:
       return
 
-    from master_thesis.evaluation.arc_policies import evaluate_planning  # imported here so training does not depend on the ARC game
-    from master_thesis.evaluation.world_model_metrics import planning_metrics
+    # imported here so training does not depend on the ARC game
+    from master_thesis.evaluation.arc_policies import evaluate_planning, evaluate_waypoints
+    from master_thesis.evaluation.world_model_metrics import planning_metrics, waypoint_metrics
 
+    evaluate, summarize = (evaluate_waypoints, waypoint_metrics) if self.mode == "waypoints" else (evaluate_planning, planning_metrics)
+    gif_dir = self.folder / f"step{step}"
     was_training = self.model.training
     self.model.eval()  # planning must be deterministic (the predictor has dropout)
-    rows = evaluate_planning(self.model, gif_dir=self.folder / f"step{step}", device=str(pl_module.device), **self.settings)
-    self.model.train(was_training)
+    try:
+      rows = evaluate(self.model, gif_dir=gif_dir, device=str(pl_module.device), **self.settings)
+      metrics = {name: value for name, value in summarize(rows).items() if value == value}  # drop NaN (e.g. no distance measured)
+      pl_module.log_dict(metrics, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard
 
-    metrics = {name: value for name, value in planning_metrics(rows).items() if value == value}  # drop NaN (e.g. no distance measured)
-    pl_module.log_dict(metrics, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard
+      writer = next(logger for logger in trainer.loggers if isinstance(logger, TensorBoardLogger)).experiment  # stable-pretraining adds its own CSV logger next to ours
+      for path in sorted(gif_dir.glob("*.gif")):  # the GIFs just written, as animations in TensorBoard
+        frames = [np.asarray(frame.convert("RGB"))[::4, ::4] for frame in ImageSequence.Iterator(Image.open(path))]  # 4x smaller (the files are enlarged 8x)
+        video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2)[None]  # [1, frames, 3, height, width] as add_video expects
+        tag = path.stem.rsplit("_", 1)[0]  # without the outcome (_completed/_failed), so one episode keeps one slider over all steps
+        writer.add_video(f"{self.mode}/{tag}", video, global_step=step, fps=4)
+    except Exception as error:  # a failing evaluation must not end a long training run
+      print(f"Planning evaluation at step {step} failed: {error!r}")
+    finally:
+      self.model.train(was_training)
 
 
 class SaveCheckpointEvery(Callback):

@@ -31,7 +31,7 @@ import arc_agi
 import numpy as np
 from arc_agi import OperationMode
 from arc_agi.local_wrapper import LocalEnvironmentWrapper
-from arcengine import FrameDataRaw, GameState
+from arcengine import FrameDataRaw, GameAction, GameState
 
 from master_thesis.paths import arc_environments_dir, recordings_dir, timestamp  # storage layout lives in paths.py
 from master_thesis.policies.arc_random import ArcRandomPolicy
@@ -48,7 +48,7 @@ def levels_tag(start_levels: list[int] | None) -> str:  # short text for collect
     return "l" + ".".join(str(level) for level in start_levels)  # single or scattered levels -> "l1" or "l2.5"
 
 
-def record_frame(file: TextIO, frame_data: FrameDataRaw, start_level: int | None = None, ) -> None:
+def record_frame(file: TextIO, frame_data: FrameDataRaw, start_level: int | None = None, extra: dict | None = None, ) -> None:  # extra: stored next to "data", e.g. where a branch came from
     """
   Store one ARC response using the same basic JSONL structure used by ARC-AGI-3-Playground.
 
@@ -61,6 +61,8 @@ def record_frame(file: TextIO, frame_data: FrameDataRaw, start_level: int | None
 
     if start_level is not None:
         event["start_level"] = start_level
+
+    event.update(extra or {})  # e.g. {"branch": {"episode": 3, "step": 27}}
 
     file.write(json.dumps(event) + "\n")
     file.flush()
@@ -104,7 +106,23 @@ def reset_at_level(env: LocalEnvironmentWrapper, start_level: int, ) -> FrameDat
     return observation  # first frame of level k. NOTE: levels_completed is 0 here even for k>1, because full_reset set score=0
 
 
-def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, ) -> Path:  # output_path is always chosen by collect_runs
+def load_branch_points(game_id: str, dataset: str) -> dict[int, list[list[int]]]:
+    """Action sequences of all recorded episodes per level (e.g. human runs), to replay before branching off."""
+    import stable_worldmodel as swm
+
+    from master_thesis.paths import dataset_path
+
+    table = swm.data.load_dataset(str(dataset_path(game_id, dataset)), num_steps=1)  # only columns and episode boundaries are needed
+    actions = table.get_col_data("action")[:, 0].astype(int)  # action id taken in each state (0 = dummy on the last state)
+    levels = table.get_col_data("start_level")[:, 0].astype(int)  # level each episode plays
+
+    per_level = {}
+    for start, length in zip(table.offsets.tolist(), table.lengths.tolist()):
+        per_level.setdefault(int(levels[start]), []).append(actions[start:start + length - 1].tolist())  # the real actions of this episode (without the dummy)
+    return per_level
+
+
+def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, prefix: list[int] | None = None, branch: dict | None = None, ) -> Path:  # output_path is always chosen by collect_runs; prefix = action ids replayed (not recorded) before the policy starts
     """
   Collect one ARC trajectory using a policy.
 
@@ -150,8 +168,10 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
     if observation is None:
         raise RuntimeError("ARC environment returned no initial observation")
 
-    if observation is None:
-        raise RuntimeError("ARC environment returned no initial observation")
+    for action_id in (prefix or []):  # branching: replay a recorded run up to the branch point (not recorded; the game is deterministic)
+        observation = env.step(GameAction.from_id(action_id))
+        if observation is None or observation.state is not GameState.NOT_FINISHED:
+            raise RuntimeError("Replaying the prefix ended the game; the recorded run does not match this game")
 
     if policy_name == "random":
         policy = ArcRandomPolicy(seed=seed)
@@ -178,8 +198,8 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
     # an existing trajectory.
     with output_path.open("x", encoding="utf-8", ) as file:  # mode "x" = create a new file, error if it exists (never overwrites)
 
-        # s0
-        record_frame(file, observation, start_level=start_level)
+        # s0 (for a branch: the state at the branch point)
+        record_frame(file, observation, start_level=start_level, extra={"branch": branch} if branch else None)
 
         actions_executed = 0
         episodes = 1
@@ -241,7 +261,7 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
     return output_path
 
 
-def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", start_levels: list[int] | None = None, ppo_run: str | None = None, device: str = "auto", name: str | None = None) -> Path:
+def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", start_levels: list[int] | None = None, ppo_run: str | None = None, device: str = "auto", name: str | None = None, branch_from: str | None = None) -> Path:  # branch_from: dataset whose episodes are replayed up to a random point before the policy starts
     """
   Record `runs` episodes per start level into one new collection folder.
   A frozen PPO policy is loaded once for the whole collection.
@@ -273,11 +293,18 @@ def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int =
     elif ppo_run is not None:
         raise ValueError("ppo_run is only used with ppo_images")
 
-    collection_name = f"{name or f'{policy_name}_{levels_tag(start_levels)}'}_{timestamp()}"  # e.g. goose_l1-7_0916-1432
+    branch_points = None
+    if branch_from is not None:
+        if not start_levels:
+            raise ValueError("branch_from requires start_levels (the replayed episodes belong to a level)")
+        branch_points = load_branch_points(game_id, branch_from)  # level -> action sequences of the recorded episodes
+
+    default_name = f"{policy_name}{'-branch' if branch_from else ''}_{levels_tag(start_levels)}"  # e.g. goose-branch_l1.2.4.5.6.7
+    collection_name = f"{name or default_name}_{timestamp()}"  # e.g. goose_l1-7_0916-1432
     collection_dir = recordings_dir(game_id) / collection_name  # recordings/<game>/<collection_name>
     collection_dir.mkdir(parents=True, exist_ok=False)  # never mix two collections
 
-    settings = {"game_id": game_id, "policy": policy_name, "runs_per_level": runs, "seed": seed, "seed_rule": f"seed + start_level * {SEED_LEVEL_OFFSET} + run_index", "start_levels": start_levels, "max_steps": max_steps, "mode": mode, "device": device, "ppo_run": ppo_run, }  # everything needed to repeat the collection
+    settings = {"game_id": game_id, "policy": policy_name, "runs_per_level": runs, "seed": seed, "seed_rule": f"seed + start_level * {SEED_LEVEL_OFFSET} + run_index", "start_levels": start_levels, "max_steps": max_steps, "mode": mode, "device": device, "ppo_run": ppo_run, "branch_from": branch_from, }  # everything needed to repeat the collection
 
     (collection_dir / "collection.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
@@ -291,9 +318,17 @@ def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int =
 
             path = level_dir / f"{policy_name}_seed{run_seed}.jsonl"
 
-            print(f"\n--- Level {start_level}, run {run_index + 1}/{runs} (seed={run_seed}) ---")
+            prefix, branch = None, None
+            if branch_points is not None:  # pick a recorded episode of this level and a random point along it
+                rng = np.random.default_rng(run_seed)  # reproducible choice per run
+                episode = int(rng.integers(len(branch_points[start_level])))
+                step = int(rng.integers(len(branch_points[start_level][episode])))  # 0 .. last move before the completion (the completing move is never replayed)
+                prefix = branch_points[start_level][episode][:step]
+                branch = {"dataset": branch_from, "episode": episode, "step": step}  # stored on the first recorded line
 
-            recordings.append(collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=path, policy_name=policy_name, start_level=start_level, ppo_policy=ppo_policy, ))
+            print(f"\n--- Level {start_level}, run {run_index + 1}/{runs} (seed={run_seed}{', branch ' + str(branch) if branch else ''}) ---")
+
+            recordings.append(collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode=mode, output_path=path, policy_name=policy_name, start_level=start_level, ppo_policy=ppo_policy, prefix=prefix, branch=branch, ))
 
     print(f"\nCollection complete: {len(recordings)} recordings in {collection_dir}")
     return collection_dir
@@ -311,6 +346,7 @@ def main() -> None:
     parser.add_argument("--ppo-run", default=None, help="Image-PPO model folder name under models/ppo (for --policy ppo_images)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", )
     parser.add_argument("--name", default=None, help="Collection name without timestamp; default <policy>_<levels>")
+    parser.add_argument("--branch-from", default=None, help="Dataset (e.g. human_l1-7) whose episodes are replayed up to a random point; the policy plays from there (only that part is recorded)")
     args = parser.parse_args()
 
     if args.runs < 1:
@@ -323,7 +359,7 @@ def main() -> None:
         if args.mode == "online":
             parser.error("--start-levels requires normal or offline mode")
 
-    collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, policy_name=args.policy, start_levels=args.start_levels, ppo_run=args.ppo_run, device=args.device, name=args.name, )
+    collect_runs(game_id=args.game, max_steps=args.max_steps, seed=args.seed, mode=args.mode, runs=args.runs, policy_name=args.policy, start_levels=args.start_levels, ppo_run=args.ppo_run, device=args.device, name=args.name, branch_from=args.branch_from, )
 
 
 if __name__ == "__main__":

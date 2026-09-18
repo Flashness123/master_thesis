@@ -40,20 +40,23 @@ def load_columns(game: str, dataset_name: str):
   return grids, actions, levels, successes, episodes  # the reader itself (with its float32 copies) is dropped here to save memory
 
 
-def grids_to_gif(grids, path, labels=None, side_grid=None, scale: int = 8, duration: int = 150):
+def grids_to_gif(grids, path, labels=None, side_grid=None, side_grids=None, scale: int = 8, duration: int = 150):
   """
   Write ARC grids as a GIF (also used by the planning evaluation).
 
-  grids:     [frames, 4096] or [frames, 64, 64] colour indices
-  labels:    optional one text per frame, drawn top left
-  side_grid: optional single grid shown to the right of every frame (e.g. the planning goal)
+  grids:      [frames, 4096] or [frames, 64, 64] colour indices
+  labels:     optional one text per frame, drawn top left
+  side_grid:  optional single grid shown to the right of every frame (e.g. the planning goal)
+  side_grids: optional one grid per frame shown to the right (e.g. the waypoint that was active)
   """
   palette = (ArcGridToPixels(64).palette.numpy() * 255).round().astype(np.uint8)  # [16, 3] colour index -> RGB
-  side = Image.fromarray(palette[np.asarray(side_grid).reshape(64, 64)]).resize((64 * scale, 64 * scale), Image.NEAREST) if side_grid is not None else None
+  enlarge = lambda grid: Image.fromarray(palette[np.asarray(grid).reshape(64, 64)]).resize((64 * scale, 64 * scale), Image.NEAREST)  # without blending colours
+  fixed_side = enlarge(side_grid) if side_grid is not None else None
 
   frames = []
   for index, grid in enumerate(grids):
-    frame = Image.fromarray(palette[np.asarray(grid).reshape(64, 64)]).resize((64 * scale, 64 * scale), Image.NEAREST)  # enlarge without blending colours
+    frame = enlarge(grid)
+    side = enlarge(side_grids[index]) if side_grids is not None else fixed_side  # per-frame side image, the fixed one, or none
     if side is not None:  # place the two images next to each other with a small gap
       both = Image.new("RGB", (frame.width * 2 + 8, frame.height), "black")
       both.paste(frame, (0, 0))

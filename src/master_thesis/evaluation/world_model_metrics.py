@@ -48,3 +48,16 @@ def planning_metrics(rows):
     metrics[f"planning/success_rate_goal{goal}"] = float(np.mean([row["reached"] for row in rows if row["goal_steps"] == goal]))
 
   return metrics
+
+
+def waypoint_metrics(rows):
+  """Summarize the attempts of evaluate_waypoints (evaluation/arc_policies.py) into scalars for TensorBoard."""
+  import numpy as np
+
+  reached = lambda selected: float(np.mean([row["waypoints_reached"] / row["waypoints_total"] for row in selected]))  # share of waypoints reached
+  metrics = {"waypoints/completion_rate": float(np.mean([row["completed"] for row in rows])), "waypoints/reached_fraction": reached(rows)}
+
+  for level in sorted({row["level"] for row in rows}):  # one curve per level (e.g. the held-out level next to the training levels)
+    metrics[f"waypoints/level{level}_reached_fraction"] = reached([row for row in rows if row["level"] == level])
+
+  return metrics
