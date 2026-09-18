@@ -2,7 +2,6 @@ import os
 import json
 import hydra
 import lightning as pl
-import numpy as np
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
@@ -13,7 +12,8 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from stable_pretraining import data as dt
 from functools import partial
 from pathlib import Path
-from PIL import Image, ImageSequence
+from PIL import Image
+from tensorboard.compat.proto.summary_pb2 import Summary
 from master_thesis.models.lewm import SIGReg
 from master_thesis.paths import model_dir, stablewm_home, timestamp
 from lightning.pytorch.callbacks import Callback
@@ -55,11 +55,11 @@ class PlanningEvaluation(Callback):
       pl_module.log_dict(metrics, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard
 
       writer = next(logger for logger in trainer.loggers if isinstance(logger, TensorBoardLogger)).experiment  # stable-pretraining adds its own CSV logger next to ours
-      for path in sorted(gif_dir.glob("*.gif")):  # the GIFs just written, as animations in TensorBoard
-        frames = [np.asarray(frame.convert("RGB"))[::4, ::4] for frame in ImageSequence.Iterator(Image.open(path))]  # 4x smaller (the files are enlarged 8x)
-        video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2)[None]  # [1, frames, 3, height, width] as add_video expects
+      for path in sorted(gif_dir.glob("*.gif")):  # the GIFs just written, as animations in TensorBoard (tab IMAGES shows GIFs as they are)
+        width, height = Image.open(path).size
         tag = path.stem.rsplit("_", 1)[0]  # without the outcome (_completed/_failed), so one episode keeps one slider over all steps
-        writer.add_video(f"{self.mode}/{tag}", video, global_step=step, fps=4)
+        image = Summary.Image(height=height, width=width, colorspace=3, encoded_image_string=path.read_bytes())  # the file itself; add_video would need moviepy (breaks on the pygame install)
+        writer._get_file_writer().add_summary(Summary(value=[Summary.Value(tag=f"{self.mode}/{tag}", image=image)]), step)
     except Exception as error:  # a failing evaluation must not end a long training run
       print(f"Planning evaluation at step {step} failed: {error!r}")
     finally:
