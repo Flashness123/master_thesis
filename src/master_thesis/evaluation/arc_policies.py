@@ -108,20 +108,25 @@ def run_episode(env, policy, max_steps: int = 500, record: bool = False, options
   return {"grids": grids, "actions": actions, "steps": len(actions), "stopped": stopped, "info": info}
 
 
-def follow_waypoints(model, env, waypoints, level: int, max_steps_per_waypoint: int = 15, ignore_cells=None, **planner_kwargs):
+def follow_waypoints(model, env, waypoints, level: int, max_steps_per_waypoint: int = 15, ignore_cells=None, solution=None, **planner_kwargs):
   """
   Complete a level by planning from waypoint to waypoint (e.g. every 5th frame of a recorded human solution).
   Each waypoint is a short planning problem; the game keeps running between them (no reset).
   Stops at the first waypoint that is not reached within `max_steps_per_waypoint` actions.
+  Pass `solution` (the frames of the recorded run) to also measure how far the played game stays on that run.
   """
   env.reset(options={"start_level": level})
   grid = env.unwrapped.grid
   grids, actions, targets, numbers = [grid], [], [waypoints[0]], [1]  # played grids, actions, and the waypoint (grid, number) active at each frame (for the GIF)
   reached = 0
 
+  compare = ~ignore_cells if ignore_cells is not None else np.ones(np.asarray(grid).size, dtype=bool)  # cells that decide "waypoint reached" (the step counter is ignored)
+  differing = lambda played, target: int((np.asarray(played).reshape(-1)[compare] != np.asarray(target).reshape(-1)[compare]).sum())  # how far the played state still is from the waypoint
+  closest = []  # per waypoint: fewest differing cells reached (0 = reached exactly)
+
   for number, waypoint in enumerate(waypoints, start=1):
     planner = LewmRolloutPlanner(model, env, waypoint, ignore_cells=ignore_cells, **planner_kwargs)
-    steps, ended = 0, False
+    steps, ended, nearest = 0, False, differing(grid, waypoint)
     while not planner.stop(grid) and steps < max_steps_per_waypoint and not ended:
       action = planner.choose_action(grid)  # plan 5 steps ahead, play the first action
       _, _, terminated, truncated, _ = env.step(action)
@@ -131,13 +136,24 @@ def follow_waypoints(model, env, waypoints, level: int, max_steps_per_waypoint: 
       targets.append(waypoint)
       numbers.append(number)
       steps += 1
+      nearest = min(nearest, differing(grid, waypoint))  # closest the played game came to this waypoint
       ended = terminated or truncated  # game over / win / step limit of the environment
 
+    closest.append(nearest)
     if not planner.stop(grid):  # this waypoint was missed: give up
       break
     reached += 1
 
-  return {"grids": grids, "actions": actions, "targets": targets, "numbers": numbers, "waypoints_reached": reached, "waypoints_total": len(waypoints), "completed": bool(env.unwrapped.success), "steps": len(actions)}
+  on_path = [_human_step(grid, solution, compare) for grid in grids] if solution is not None else []  # which frame of the recorded run each played state is (-1 = none)
+
+  return {"grids": grids, "actions": actions, "targets": targets, "numbers": numbers, "waypoints_reached": reached, "waypoints_total": len(waypoints), "completed": bool(env.unwrapped.success), "steps": len(actions), "closest_cells": closest,
+          "on_path_fraction": round(float(np.mean([step >= 0 for step in on_path])), 2) if on_path else None, "furthest_human_step": max(on_path) if on_path else None}
+
+
+def _human_step(grid, solution, compare):
+  """Index of the frame of `solution` that the played state matches (ignoring the counter cells), or -1 if it matches none."""
+  matches = (np.asarray(solution)[:, compare] == np.asarray(grid).reshape(-1)[compare]).all(axis=1)
+  return int(matches.argmax()) if matches.any() else -1
 
 
 def counter_cells(grids, episodes, max_changed: int = 10):
@@ -235,9 +251,11 @@ def evaluate_waypoints(model, game: str = "ls20", game_id: str = "ls20-9607627b"
       if len(waypoints) == 0 or not np.array_equal(waypoints[-1], solution[-1]):
         waypoints.append(solution[-1])  # ... and always the completion frame as the last waypoint
 
-      played = follow_waypoints(model, env, waypoints, level, max_steps_per_waypoint=max_steps_factor * waypoint_every, ignore_cells=ignore, device=device, seed=seed, **planner_kwargs)
+      played = follow_waypoints(model, env, waypoints, level, max_steps_per_waypoint=max_steps_factor * waypoint_every, ignore_cells=ignore, solution=solution, device=device, seed=seed, **planner_kwargs)
 
-      row = {"level": level, "episode": index, "completed": played["completed"], "waypoints_reached": played["waypoints_reached"], "waypoints_total": played["waypoints_total"], "steps": played["steps"], "human_steps": length - 1}
+      row = {"level": level, "episode": index, "completed": played["completed"], "waypoints_reached": played["waypoints_reached"], "waypoints_total": played["waypoints_total"], "steps": played["steps"], "human_steps": length - 1,
+             "closest_cells": played["closest_cells"],  # per attempted waypoint the fewest cells still differing (0 = reached)
+             "on_path_fraction": played["on_path_fraction"], "furthest_human_step": played["furthest_human_step"]}  # how much of the played game lies on the recorded run
       rows.append(row)
       print(", ".join(f"{key}={value}" for key, value in row.items()))
 

@@ -252,7 +252,12 @@ def lewm_forward(self, batch, stage, cfg, ):
 
   prediction_loss = (predictions - targets).pow(2).mean()
 
-  sigreg_loss = self.sigreg(embeddings.transpose(0, 1))
+  # sigreg_loss = self.sigreg(embeddings.transpose(0, 1))  # raw LeWM: SIGReg on the embeddings themselves (same as temporally_centered: false)
+
+  # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames)
+  # instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
+  sigreg_input = embeddings - embeddings.mean(dim=1, keepdim=True) if cfg.loss.sigreg.get("temporally_centered", False) else embeddings  # [B, T, D]
+  sigreg_loss = self.sigreg(sigreg_input.transpose(0, 1))
 
   loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss)
 

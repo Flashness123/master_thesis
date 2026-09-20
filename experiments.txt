@@ -1,0 +1,53 @@
+1. trained for 5 hours on level 1 - good rollouts, give subgoals from human run and reach tehm with cem 12/13 exxcept for the last one
+
+
+Single level model vs multi level model
+┌────────────────────────────────────────────────────────────┬────────────────────┬──────────────────────────┐
+│                          episodes                     │ single-level model 130k │ multi-level model (220k) │
+├────────────────────────────────────────────────────────────┼────────────────────┼──────────────────────────┤
+│ L1, eps 10 / 12 / 13 (l1_human-goose, short: 13–19 moves)  │ 2/3, 2/3, 3/4      │ 2/3, 2/3, 3/4            │
+├────────────────────────────────────────────────────────────┼────────────────────┼──────────────────────────┤
+│ L2, eps 1 / 19 (l2_human-goose)                            │ 8/9, 8/9           │ 0/9, 0/9                 │
+├────────────────────────────────────────────────────────────┼────────────────────┼──────────────────────────┤
+│ L1, ep 0 of human_l1-7 (the training evaluation's episode) │ 8/9                │ 1/9                      │
+├────────────────────────────────────────────────────────────┼────────────────────┼──────────────────────────┤
+│ L2, ep 2 of human_l1-7 (the training evaluation's episode) │ 8/9                │ 0/9                      │
+└────────────────────────────────────────────────────────────┴────────────────────┴──────────────────────────┘
+
+┌─────────────────┬───────────┬───────────────────┬───────────┬───────────────┐
+│      model      │ distance  │ human action best │ mean rank │ action spread │
+├─────────────────┼───────────┼───────────────────┼───────────┼───────────────┤
+│ single-level L2 │ predicted │ 12.5 %            │ 3.45      │ 22.75         │
+├─────────────────┼───────────┼───────────────────┼───────────┼───────────────┤
+│ single-level L2 │ real      │ 40.0 %            │ 2.05      │ 36.91         │
+├─────────────────┼───────────┼───────────────────┼───────────┼───────────────┤
+│ multi-level     │ predicted │ 37.5 %            │ 2.08      │ 1.96          │
+├─────────────────┼───────────┼───────────────────┼───────────┼───────────────┤
+│ multi-level     │ real      │ 40.0 %            │ 2.20      │ 2.50          │
+└─────────────────┴───────────┴───────────────────┴───────────┴───────────────┘
+
+Random choice would be 25 % and mean rank 2.5.
+
+From the training logs (final validation):
+
+┌─────────────────┬───────────────┬────────────────┐
+│                 │ val/copy_loss │ val/action_gap │
+├─────────────────┼───────────────┼────────────────┤
+│ single-level L2 │ 0.924         │ 1.037          │
+├─────────────────┼───────────────┼────────────────┤
+│ multi-level     │ 0.163         │ 0.021          │
+└─────────────────┴───────────────┴────────────────┘
+
+- Observed: in the multi-level model an action changes the embedding very little.
+  - The distance to the goal differs by only ~2 between actions, against ~23–37 in the single-level model.
+  - Consecutive states are ~6× closer (copy loss) and the effect of an action is ~50× smaller (action gap).
+  - The distance to the goal hardly changes from one step to the next (e.g. 308 → 308 → 309, see the per-step table).
+- Observed: measured by rank, the two models point in the right direction about equally often.
+  - The real next states rank the human action best 40 % of the time for both.
+  - Strangely, the single-level model's 1-step prediction ranks the human action worse than random (mean rank 3.45), and it still plans successfully. So the 1-step rank doesn't explain planning success: the planner scores 5-step sequences (closest approach to the goal), not single moves.
+
+Interpretation (hypothesis, not tested)
+
+SIGReg pushes the embeddings of each batch towards a spread of 1 in every direction. When a batch mixes 6 levels, most of that spread is used to tell the levels apart, which differ in their whole layout. The player's position inside a level, the thing that matters for navigation, gets only a tiny part of the embedding.
+
+The direction information is still there (40 % rank-1, like the single-level model), but it's ~15–20× weaker. It is then probably drowned out by prediction errors, so CEM finds no consistent direction. This fits the observations so far: the prediction loss looks good, the planner hovers near the start, and level 3 never works.

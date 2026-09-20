@@ -22,9 +22,10 @@ cd "$HOME/master_thesis"
 source hpc_env.sh  # STABLEWM_HOME, venv, uv
 
 DATASET="human-goose-branch_l1.2.4.5.6.7"  # datasets/ls20/<DATASET>.lance
-RUN_NAME="${RUN_NAME:-ls20_multi-no-l3_220k}"  # models/lewm/<RUN_NAME>_<MMDD-HHMM>
+RUN_NAME="${RUN_NAME:-ls20_multi-no-l3_220k_succ0.1}"  # models/lewm/<RUN_NAME>_<MMDD-HHMM>
 STEPS="${STEPS:-220000}"  # optimizer steps (~7.6 it/s -> ~8 h, leaves time for validation and planning)
 BATCH_SIZE="${BATCH_SIZE:-128}"
+SUCCESS_SHARE="${SUCCESS_SHARE:-0.1}"  # share of training samples from successful episodes, per level (the data has ~3 %)
 PLANNING_EVERY="${PLANNING_EVERY:-10000}"  # waypoint rollout in the real game every N steps (GIFs + waypoints/* in TensorBoard)
 OVERRIDES="${OVERRIDES:-}"  # extra Hydra overrides, e.g. --export=ALL,OVERRIDES="checkpoint_every_steps=100 planning.levels=[1,3]"
 
@@ -40,7 +41,7 @@ srun "$UV_PROJECT_ENVIRONMENT/bin/python" -m master_thesis.training.lewm --confi
   trainer.check_val_every_n_epoch=10 \
   loader.batch_size="$BATCH_SIZE" \
   loader.num_workers=12 \
-  sampling.success_probability_sampling=0.5 \
+  sampling.success_probability_sampling="$SUCCESS_SHARE" \
   planning.every_steps="$PLANNING_EVERY" \
   planning.mode=waypoints \
   planning.samples=300 \
