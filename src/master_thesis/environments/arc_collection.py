@@ -13,11 +13,11 @@ $STABLEWM_HOME/recordings/<game>/
     ├── collection.json                 ← settings of this call (policy, seed, runs, start levels, PPO run …)
     ├── level_1/                        ← one folder per --start-levels entry
     │   ├── goose_seed10042.jsonl       ← one recording = one episode (Goose/PPO); seed = seed + level * 10000 + run
-    │   └── …
+    │   └── inside one line = one ARC response = one state + action that produced it = line 0: {frame: s0, action_input: null/RESET, levels_completed: 0, start_level: 1}
+    │                                                                                  line 1: {frame: s1, action_input: a0}
     └── level_7/
 Without --start-levels the recordings lie directly in the collection folder (normal ARC reset, level unknown).
 """
-# (this text must stay ABOVE the imports; only then Python treats it as the module docstring)
 
 from __future__ import annotations
 
@@ -107,19 +107,22 @@ def reset_at_level(env: LocalEnvironmentWrapper, start_level: int, ) -> FrameDat
 
 
 def load_branch_points(game_id: str, dataset: str) -> dict[int, list[list[int]]]:
-    """Action sequences of all recorded episodes per level (e.g. human runs), to replay before branching off."""
+    """
+    Return all action sequences of all recorded episodes per level (e.g. human runs), to replay before branching off.
+    Records only the new branched off run, the replay is not recorded
+    """
     import stable_worldmodel as swm
 
     from master_thesis.paths import dataset_path
 
     table = swm.data.load_dataset(str(dataset_path(game_id, dataset)), num_steps=1)  # only columns and episode boundaries are needed
-    actions = table.get_col_data("action")[:, 0].astype(int)  # action id taken in each state (0 = dummy on the last state)
-    levels = table.get_col_data("start_level")[:, 0].astype(int)  # level each episode plays
+    actions = table.get_col_data("action")[:, 0].astype(int)  # column 0 of [id, x, y] = the action id. NOTE: x/y are DROPPED, so branching only works for click-free games like ls20
+    levels = table.get_col_data("start_level")[:, 0].astype(int)  # constant within an episode, so reading it at the first row is enough
 
     per_level = {}
     for start, length in zip(table.offsets.tolist(), table.lengths.tolist()):
         per_level.setdefault(int(levels[start]), []).append(actions[start:start + length - 1].tolist())  # the real actions of this episode (without the dummy)
-    return per_level
+    return per_level # return a sequence of action of that level
 
 
 def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, prefix: list[int] | None = None, branch: dict | None = None, ) -> Path:  # output_path is always chosen by collect_runs; prefix = action ids replayed (not recorded) before the policy starts
@@ -199,7 +202,7 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
     with output_path.open("x", encoding="utf-8", ) as file:  # mode "x" = create a new file, error if it exists (never overwrites)
 
         # s0 (for a branch: the state at the branch point)
-        record_frame(file, observation, start_level=start_level, extra={"branch": branch} if branch else None)
+        record_frame(file, observation, start_level=start_level, extra={"branch": branch} if branch else None) #dataset, episode, step recorded as branching off point
 
         actions_executed = 0
         episodes = 1
@@ -263,10 +266,10 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
 
 def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int = 1, policy_name: str = "random", start_levels: list[int] | None = None, ppo_run: str | None = None, device: str = "auto", name: str | None = None, branch_from: str | None = None) -> Path:  # branch_from: dataset whose episodes are replayed up to a random point before the policy starts
     """
-  Record `runs` episodes per start level into one new collection folder.
-  A frozen PPO policy is loaded once for the whole collection.
-  Returns the collection folder.
-  """
+    Record `runs` episodes per start level into one new collection folder.
+    A frozen PPO policy is loaded once for the whole collection.
+    Returns the collection folder.
+    """
 
     if runs < 1 or max_steps < 1:
         raise ValueError("runs and max_steps must be positive")
@@ -287,7 +290,6 @@ def collect_runs(game_id: str, max_steps: int, seed: int, mode: str, runs: int =
             raise ValueError("ppo_images requires ppo_run")
 
         from master_thesis.policies.arc_ppo import ArcImagePPOPolicy
-
         ppo_policy = ArcImagePPOPolicy(ppo_run, device=device, )  # loads models/ppo/<ppo_run>/policy.zip once
 
     elif ppo_run is not None:
@@ -343,10 +345,10 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=1, help=("Recordings per start level"))
     parser.add_argument("--policy", choices=["random", "goose", "ppo_images"], default="random")
     parser.add_argument("--start-levels", type=int, nargs="+", default=None, help="Start levels, numbered from 1, e.g. --start-levels 1 2 3; local modes only", )
-    parser.add_argument("--ppo-run", default=None, help="Image-PPO model folder name under models/ppo (for --policy ppo_images)")
+    parser.add_argument("--ppo-run", default=None, help="Image-PPO model folder name under models/ppo (for --policy ppo_images)")   # Giving same frozen policy to every collect_game
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", )
     parser.add_argument("--name", default=None, help="Collection name without timestamp; default <policy>_<levels>")
-    parser.add_argument("--branch-from", default=None, help="Dataset (e.g. human_l1-7) whose episodes are replayed up to a random point; the policy plays from there (only that part is recorded)")
+    parser.add_argument("--branch-from", default=None, help="Dataset (e.g. human_l1-7) whose episodes are replayed up to a random point; the policy plays from there (only that part is recorded)")  # to branch from a good policy and start exploring with a different one, f.e. human runs and somple random from a certain point
     args = parser.parse_args()
 
     if args.runs < 1:
