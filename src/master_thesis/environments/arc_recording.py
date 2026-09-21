@@ -28,6 +28,18 @@ from master_thesis.paths import dataset_path
 ├──────────┼────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
 │ Access   │ read the file line by line                 │ random access to any 4-state window (what the LeWM dataloader uses)                       │
 └──────────┴────────────────────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────┘
+
+.lance columns:
+episode_idx          0
+step_idx             5
+grid                 list[4096] float32, values [0.0, 1.0, 3.0, 4.0, 5.0, 8.0, 9.0, 11.0, 12.0]  #different colour sin THIS frame
+action               [3.0, -1.0, -1.0]  # Action taken in the current state
+terminal             [0.0]
+levels_completed     [0.0]
+available_actions    [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+game_id              'ls20-9607627b'
+start_level          [1.0]
+episode_success      [0.0]
 """
 
 GRID_SIZE = 64
@@ -59,7 +71,6 @@ class ArcTransition:
 
 def load_recording(path: str | Path) -> list[dict[str, Any]]: # read a JSONL file into a list of dicts (one per line - one line is one move in the game)
     path = Path(path)
-
     events = []
 
     with path.open("r", encoding="utf-8") as file:
@@ -75,7 +86,7 @@ def load_recording(path: str | Path) -> list[dict[str, Any]]: # read a JSONL fil
     if not events:
         raise ValueError(f"Recording is empty: {path}")
 
-    return events  # list of {"timestamp", "data", ["start_level"]}
+    return events  # list of [ timestamp, data:{ game_id, state, levels completed, win levels, action input:{ id, data, reasoning }, guid, full reset, available actions, frame } ]
 
 
 def get_final_frame(event: dict[str, Any]) -> np.ndarray:
@@ -258,9 +269,7 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
 
   Playground rows contain:
 
-      current_state
-      +
-      action_input = action that produced current_state
+      current_state  +  action_input = action that produced current_state
 
   We convert:
 
@@ -320,12 +329,11 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
         terminal = game_state in {"WIN", "GAME_OVER", }
 
         transitions.append(
-          ArcTransition(game_id=str(data["game_id"]), episode=max(episode, 0), start_level=episode_start_level, state=previous_frame, action=action, next_state=frame, terminal=terminal, game_state=game_state, levels_completed_before=int(previous_data.get("levels_completed", 0,
-                                                                                                                                                                                                                                                               )),
-                        levels_completed_after=int(data.get("levels_completed", 0,
-                                                            )), available_actions=available_actions, next_available_actions=tuple(int(value) for value in data.get("available_actions", [],
-                                                                                                                                                                   )),
-                        ))
+          ArcTransition(game_id=str(data["game_id"]), episode=max(episode, 0), start_level=episode_start_level, state=previous_frame, action=action, next_state=frame, 
+                        terminal=terminal, game_state=game_state, levels_completed_before=int(previous_data.get("levels_completed", 0,)), 
+                        levels_completed_after=int(data.get("levels_completed", 0,)), available_actions=available_actions, 
+                        next_available_actions=tuple(int(value) for value in data.get("available_actions", [],)),)
+                        )
 
         # Never create a transition out of a terminal
         # state. The next RESET starts a new episode.
@@ -346,10 +354,8 @@ def build_transitions(events: list[dict[str, Any]], ) -> list[ArcTransition]:
 
 def recording_files(source: Path) -> list[Path]:  # one .jsonl file, or every .jsonl inside a collection folder (incl. level_<k>/)
     files = sorted(source.rglob("*.jsonl")) if source.is_dir() else [source]  # sorted -> reproducible episode order
-
     if not files:
         raise ValueError(f"No .jsonl recordings found in {source}")
-
     return files
 
 
@@ -402,7 +408,7 @@ def main() -> None:
     parser.add_argument("--levels", type=int, nargs="+", default=None, help="keep only episodes of these levels, e.g. --levels 1 (default: all)")
     args = parser.parse_args()
 
-    files = recording_files(args.recording)
+    files = recording_files(args.recording)  # .jsonl files sorted
     events = load_recording(files[0])  # the first file is inspected below
     transitions = build_transitions(events)
 
@@ -424,10 +430,7 @@ def main() -> None:
         print(f"raw action [id, x, y]: {transition.action.tolist()}")
         print(f"changed cells: {changed_cells}")
         print(f"next state: {transition.game_state}")
-        print("  levels: "
-              f"{transition.levels_completed_before}"
-              " -> "
-              f"{transition.levels_completed_after}")
+        print(f"levels: {transition.levels_completed_before} -> {transition.levels_completed_after}")
         print(f"terminal: {transition.terminal}")
 
     if args.dataset is not None:

@@ -15,6 +15,7 @@ $STABLEWM_HOME/recordings/<game>/
     │   ├── goose_seed10042.jsonl       ← one recording = one episode (Goose/PPO); seed = seed + level * 10000 + run
     │   └── inside one line = one ARC response = one state + action that produced it = line 0: {frame: s0, action_input: null/RESET, levels_completed: 0, start_level: 1}
     │                                                                                  line 1: {frame: s1, action_input: a0}
+    │   real columns: timestamp, data:{ game_id, state, levels completed, win levels, action input:{ id, data, reasoning }, guid, full reset, available actions, frame }
     └── level_7/
 Without --start-levels the recordings lie directly in the collection folder (normal ARC reset, level unknown).
 """

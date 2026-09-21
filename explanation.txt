@@ -106,8 +106,7 @@ uv run python -m master_thesis.environments.arc_collection ls20-9607627b \
   --mode offline --policy goose --start-levels 1 2 3 4 5 6 7 --runs 100 --max-steps 500 --seed 42
 
 Frozen image-PPO as policy (name of a folder in models/ppo):
-uv run python -m master_thesis.environments.arc_collection ls20-9607627b \
-  --mode offline --policy ppo_images --ppo-run ls20_images_l1-7_0914-1220 \
+uv run python -m master_thesis.environments.arc_collection ls20-9607627b --mode offline --policy ppo_images --ppo-run ls20_images_l1-7_0914-1220 \
   --start-levels 1 2 3 4 5 6 7 --runs 100 --max-steps 500 --seed 900000 --device cuda
 
 Options: --name <text> replaces the default collection name <policy>_<levels>.
@@ -133,8 +132,7 @@ What the converter does:
   - lines without a frame (e.g. the scorecard summary in human recordings) are skipped
 
 Human data example:
-uv run python -m master_thesis.environments.arc_recording \
-  "$STABLEWM_HOME/recordings/ls20/human_l1-7_arcprize" --dataset human_l1-7
+uv run python -m master_thesis.environments.arc_recording "$STABLEWM_HOME/recordings/ls20/human_l1-7_arcprize" --dataset human_l1-7
 
 
 3. Evaluate a dataset (metrics, heatmap, GIFs)
