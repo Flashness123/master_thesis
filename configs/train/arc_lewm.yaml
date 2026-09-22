@@ -33,7 +33,7 @@ val_split: 0.1
 img_size: 224
 embed_dim: 192
 sampling:
-  success_probability_sampling: 0.5
+  success_probability_sampling: 0.2
 
 wm:
   history_size: 3
@@ -72,8 +72,6 @@ optimizer:
 loss:
   sigreg:
     weight: 0.09
-    # temporally_centered: false  # raw LeWM: SIGReg on the embeddings themselves (all runs up to ls20_multi-no-l3_220k_succ0.1_0918-1951)
-    temporally_centered: true  # TC-SIGReg: SIGReg on the embeddings minus their mean over the window (arXiv:2607.26924)
     kwargs:
       knots: 17
       num_proj: 1024

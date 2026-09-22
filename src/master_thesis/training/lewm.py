@@ -1,3 +1,5 @@
+#TODO: Make bit process 64 x 64
+#      Do we have to set action_input_dim?
 import os
 import json
 import hydra
@@ -86,8 +88,12 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
   Convert an ARC-AGI-3 categorical 64x64 grid into RGB pixels for
   vanilla LeWM's existing 3-channel ViT encoder.
 
-  Resize uses nearest-neighbor interpolation so no artificial ARC
-  colors are introduced.
+  GETS:    grids [T, 4096] float32, straight from the Lance `grid` column.
+           T = 4 during LeWM training (one 4-state window), T = 1 in ppo.py.
+           Each value is a colour INDEX 0..15, stored as float (Lance has no int columns here).
+  DOES:    index -> RGB via a fixed 16-colour palette, resize 64 -> img_size (nearest,
+           so no new colours are invented), then ImageNet-normalize.
+  RETURNS: pixels [T, 3, img_size, img_size] float32, ready for JEPA.encode's ViT.
   """
 
   def __init__(self, img_size: int):
@@ -114,10 +120,9 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
         [163, 86, 214],  # 15
       ],
       dtype=torch.float32,
-    ) / 255.0
+    ) / 255.0  # scale 0..255 -> 0..1
 
     self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel mean, shaped to broadcast over [T, 3, H, W]
-
     self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel std (conventional for ViTs; the ViT isn't pretrained here, so it's just a fixed scaling)
 
   def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:  # grids: [T, 4096] float32 from Lance (T = 4 in training, 1 in ppo.py)
@@ -132,147 +137,188 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
 
     palette = self.palette.to(grids.device)
 
-    pixels = palette[grids]
+    pixels = palette[grids]  #[T,64,64] indices -> [T,64,64,3] RGB
 
-    # [T, H, W, RGB]
-    # ->
-    # [T, RGB, H, W]
-    pixels = pixels.permute(0, 3, 1, 2, )
+    pixels = pixels.permute(0, 3, 1, 2, )  # [T, H, W, RGB] -> [T, RGB, H, W]
 
-    pixels = F.interpolate(pixels, size=(self.img_size, self.img_size, ), mode="nearest", )
+    pixels = F.interpolate(pixels, size=(self.img_size, self.img_size, ), mode="nearest", )  #resize 64 -> img_size 224  #   mode="nearest" on PURPOSE: bilinear would blend neighbouring cells into colours that are not in the palette, corrupting the categorical structure. Nearest just enlarges pixels.
 
     mean = self.mean.to(pixels.device)
     std = self.std.to(pixels.device)
 
     return (pixels - mean) / std  # normalized [T, 3, 224, 224]
 
-
-class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (the only implementation of this encoding)
+class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (7-way one-hot + normalized x + normalized y)
   """
-  Convert canonical ARC actions:
+  Turn one episode's raw actions into the fixed-width vector the action encoder expects.
 
-      [action_id, x, y]
-
-  into a 9-D LeWM representation:
-
-      7-D action one-hot + normalized x + normalized y.
-
-  ACTION6 is the coordinate-based action.
-
-  The boundary action [0, -1, -1] becomes an all-zero vector.
+  GETS:    actions [..., 3] = [action_id, x, y] from the Lance `action` column, as float.
+           action_id: 1..7 real ARC actions; 0 is the boundary/dummy on an episode's last state.
+           x, y: only meaningful for the click action (id 6); -1 otherwise; 0..63 for a click.
+  DOES:    id -> 7-way one-hot; boundary (id 0) -> all zeros; append x/63, y/63 (only for clicks).
+  RETURNS: [..., 9] float32 = 7 one-hot dims + normalized x + normalized y.
   """
 
   def __call__(self, actions: torch.Tensor, ) -> torch.Tensor:
 
     if actions.shape[-1] != 3:
-      raise ValueError(f"Expected ARC actions with shape (..., 3), "
-                       f"got {tuple(actions.shape)}")
+      raise ValueError(f"Expected ARC actions with shape (..., 3), got {tuple(actions.shape)}")
 
-    action_ids = actions[..., 0, ].long()
-
+    action_ids = actions[..., 0, ].long()  # .long(): needed for one_hot and for == comparisons below
     x = actions[..., 1, ]
-
     y = actions[..., 2, ]
 
-    boundary = (action_ids == 0)
-
+    boundary = (action_ids == 0)  # the synthetic end-of-episode action
     valid = (boundary | ((action_ids >= 1) & (action_ids <= 7)))
-
     if not torch.all(valid):
       raise ValueError("ARC action IDs must be 0..7")
 
     safe_ids = torch.where(boundary, torch.ones_like(action_ids), action_ids, )
+    one_hot = F.one_hot(safe_ids - 1, num_classes=7, ).float()  # id 1 -> [1,0,..], id 7 -> [..,0,1]
 
-    one_hot = F.one_hot(safe_ids - 1, num_classes=7, ).float()
-
-    # Boundary action is not a real ARC action.
+    # Now erase the fake one-hot we gave the boundary: (~boundary) is 0 there, 1 elsewhere.
+    # unsqueeze(-1) so the [...,1] mask broadcasts over the 7 one-hot columns.
     one_hot = one_hot * (~boundary).unsqueeze(-1)
 
     is_click = (action_ids == 6)
-
     if torch.any(is_click & ((x < 0) | (x > 63) | (y < 0) | (y > 63))):
       raise ValueError("ACTION6 coordinates must be in 0..63")
 
     x_normalized = torch.where(is_click, x / 63.0, torch.zeros_like(x), )
-
     y_normalized = torch.where(is_click, y / 63.0, torch.zeros_like(y), )
 
-    return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )
-
+    return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )  # --- assemble the 9-D vector: [7 one-hot | x/63 | y/63] ---
 
 def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows and attaches the transforms
+  """
+  Open one Lance dataset as overlapping fixed-length windows and wire the transforms onto it.
+
+  GETS:    cfg -- the resolved Hydra config. Uses cfg.data.* (which Lance table, frameskip,
+           which columns), cfg.wm.history_size + cfg.wm.num_preds (window length), cfg.img_size.
+  DOES:    load_dataset gives a windowed view of the table; then attach ArcGridToPixels and
+           ArcActionEncoding as the per-sample transform; then record the action dim back into cfg.
+  RETURNS: a stable-worldmodel dataset whose __getitem__ yields one window as
+           {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
+           {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
+           (T = history_size + num_preds = 4.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
+  """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
     raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
 
   dataset_name = cfg.data.name
+  dataset = swm.data.load_dataset(dataset_name, transform=None,  # The windowing call (stable-worldmodel, not our code). num_steps=4 means every sample is 4 consecutive states of ONE episode; consecutive windows overlap (slide by 1). This is why a 41-state episode yields 38 windows. frameskip=1 -> no frames skipped (one ARC step = one transition).
+                                  frameskip=cfg.data.frameskip, 
+                                  num_steps=(cfg.wm.history_size + cfg.wm.num_preds), 
+                                  keys_to_load=list(cfg.data.keys_to_load), ) 
 
-  dataset = swm.data.load_dataset(dataset_name, transform=None, frameskip=cfg.data.frameskip, num_steps=(cfg.wm.history_size + cfg.wm.num_preds), keys_to_load=list(cfg.data.keys_to_load), )
-
-  grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))
-
-  action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))
-
-  dataset.transform = (dt.transforms.Compose(grid_transform, action_transform, ))
-
+  grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))  # [4096]->[3,224,224]
+  action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))  # [3]->[9]
+  dataset.transform = (dt.transforms.Compose(grid_transform, action_transform, ))  # run them in order for every item
   action_input_dim = 9  # 7 action one-hot + x + y
 
   with open_dict(cfg):
     cfg.model.action_encoder.input_dim = (action_input_dim)
 
   print(f"Dataset: {dataset_name}")
-  print(f"Samples: {len(dataset)}")
-  print(f"Action encoder input: "
-        f"{action_input_dim}")
+  print(f"Samples: {len(dataset)}")  # number of 4-state windows across ALL episodes
+  print(f"Action encoder input: {action_input_dim}")
+  return dataset  # {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]}
 
-  return dataset
-
-
-def lewm_forward(self, batch, stage, cfg, ):
+def build_dataloaders(dataset, cfg: DictConfig):
   """
-    LeWM training objective.
+  Split the windows into train/val/test and build the three DataLoaders.
+  !!! We split by episodes not by wondows so episodes must be genuinely independent for this to work !!!
 
-    Encode observations, predict the next latent state,
-    and optimize prediction MSE + SIGReg.
-    """
-  history_size = cfg.wm.history_size
-  num_preds = cfg.wm.num_preds
+  GETS:    dataset -- the windowed Lance view from build_dataset; cfg for split fractions,
+           loader settings, seed, and the sampling block.
+  DOES:    split by EPISODE (never by window, so no window straddles two splits and no episode
+           leaks across them); map every window to its episode's split; build loaders. The train
+           loader uses build_arc_sampler (level/success-weighted) instead of plain shuffling.
+  RETURNS: (train_loader, val_loader, test_loader).
+  """
+  train_fraction = cfg.train_split
+  val_fraction = cfg.val_split
 
-  output = self.model.encode(batch)
+  if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and train_fraction + val_fraction < 1):
+    raise ValueError("train_split and val_split must be positive and sum to less than 1")
 
-  embeddings = output["emb"]
-  action_embeddings = output["act_emb"]
+  episode_ids = sorted({episode for episode, _ in dataset.clip_indices})   # clip_indices is stable-worldmodel's list of (episode, start-in-episode) for every window. An episode shorter than num_steps (e.g. a 3-state episode) yields NO windows and is silently absent here
+  # Split on episodes, not windows: two overlapping windows of one episode share 3 of 4 states,
+  # so putting them in different splits would leak train info into val/test.
+  generator = torch.Generator().manual_seed(cfg.seed)
+  order = torch.randperm(len(episode_ids), generator=generator).tolist()  # the same window can appear multiple times in one epoch, and some windows may not appear at all
+  episode_ids = [episode_ids[index] for index in order]
 
-  context_embeddings = embeddings[:, :history_size, ]
+  num_train = int(len(episode_ids) * train_fraction)
+  num_val = int(len(episode_ids) * val_fraction)
+  num_test = len(episode_ids) - num_train - num_val
 
-  context_actions = action_embeddings[:, :history_size, ]
+  if min(num_train, num_val, num_test) < 1:
+    raise ValueError("Not enough eligible episodes for these split proportions")
 
-  targets = embeddings[:, num_preds:, ]
+  episode_groups = (episode_ids[:num_train], episode_ids[num_train:num_train + num_val], episode_ids[num_train + num_val:], )
 
-  predictions = self.model.predict(context_embeddings, context_actions, )
+  # Map each episode to one split: 0=train, 1=val, 2=test.
+  episode_to_split = {}
+  for split_index, episodes in enumerate(episode_groups):
+    for episode in episodes:
+      episode_to_split[episode] = split_index
 
-  prediction_loss = (predictions - targets).pow(2).mean()
+  # Assign every window according to its episode.
+  window_groups = [[], [], []]
+  for window_index, (episode, _) in enumerate(dataset.clip_indices):
+    split_index = episode_to_split[episode]
+    window_groups[split_index].append(window_index)
 
-  # sigreg_loss = self.sigreg(embeddings.transpose(0, 1))  # raw LeWM: SIGReg on the embeddings themselves (same as temporally_centered: false)
+  train_set, val_set, test_set = [torch.utils.data.Subset(dataset, indices) for indices in window_groups]
 
-  # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames)
-  # instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
-  sigreg_input = embeddings - embeddings.mean(dim=1, keepdim=True) if cfg.loss.sigreg.get("temporally_centered", False) else embeddings  # [B, T, D]
-  sigreg_loss = self.sigreg(sigreg_input.transpose(0, 1))
+  for name, episodes, indices in zip(("train", "val", "test"), episode_groups, window_groups):
+    print(f"{name}: {len(episodes)} episodes, {len(indices)} windows")
+  loader_cfg = OmegaConf.to_container(cfg.loader, resolve=True)
+  sampling_cfg = cfg.get("sampling")
 
-  loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss)
+  if sampling_cfg is not None:
+    sampler = build_arc_sampler(dataset=dataset, train_indices=window_groups[0], success_probability_sampling=sampling_cfg.success_probability_sampling, seed=int(cfg.seed) + 1, )
+    train_loader_cfg = dict(loader_cfg)
+    train_loader_cfg.pop("shuffle", None)  # a sampler and shuffle=True are mutually exclusive in DataLoader
+    train_loader = torch.utils.data.DataLoader(train_set, **train_loader_cfg, sampler=sampler, generator=generator, )
+  else:
+    train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator, )
 
-  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps)
-    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+  eval_loader_cfg = dict(loader_cfg)
+  eval_loader_cfg["shuffle"] = False
+  eval_loader_cfg["drop_last"] = False
 
-  else:  # validation: one value per epoch
-    metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
-    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )
-
-  return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
-
+  # Shuffled so each batch mixes episodes; otherwise batch statistics (SIGReg, batch_latent_std) are inflated by consecutive windows of one episode.
+  val_loader = torch.utils.data.DataLoader(val_set, **{**eval_loader_cfg, "shuffle": True}, generator=generator, )  # shuffled
+  test_loader = torch.utils.data.DataLoader(test_set, **eval_loader_cfg)  # In order
+  return train_loader, val_loader, test_loader  # drawn by weighted sampler, shuffled, ordered
 
 def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed):
-  """Sample levels, outcome groups, episodes, then windows."""
+  """
+  Build a weighted sampler so training draws windows by LEVEL and by OUTCOME, not uniformly.
+
+  GETS:    dataset -- the windowed Lance view (used for its metadata columns + episode geometry).
+           train_indices -- the window indices that belong to the TRAIN split (from build_dataloaders).
+           success_probability_sampling -- p in (0,1): within a level, the share of draws that should
+             come from SUCCESSFUL episodes (the rest from failed ones).
+           seed -- RNG seed for the sampler (caller passes cfg.seed + 1).
+  DOES:    reads start_level + episode_success straight off the Lance table (bypassing the batch),
+           groups train episodes by (level, success), then assigns each window a draw weight so that:
+             every level is equally likely (1/num_levels), and
+             within a level, success vs failure is split p : 1-p.
+  RETURNS: a WeightedRandomSampler over the train windows (replacement=True), i.e. an object the
+           DataLoader calls to pick which window index to fetch next.
+
+  Important to know:
+  The probability mass is split evenly at every level of the hierarchy — level, then outcome, then episode, then window — not by how much data each holds.
+
+  draw prob of one window
+  = (1 / num_levels)          ← every level equally likely, even if level 1 has 100x the data
+  x (p  or  1-p)              ← success/failure share within the level
+  / num_episodes_in_bucket    ← every episode in the bucket equally likely
+  / num_windows_in_episode    ← every window in the episode equally likely
+  """
   p = float(success_probability_sampling)
 
   if not 0 < p < 1:
@@ -281,19 +327,15 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
   if not train_indices:
     raise ValueError("The training split contains no windows")
 
-  # Read metadata directly from Lance.
-  # These columns do not need to enter model-input batches.
+  # Read metadata directly from Lance. These columns do not need to enter model-input batches.
   start_levels = torch.as_tensor(dataset.get_col_data("start_level")).reshape(-1)
-
   successes = torch.as_tensor(dataset.get_col_data("episode_success")).reshape(-1)
 
   total_rows = sum(int(length) for length in dataset.lengths)
-
   if start_levels.numel() != total_rows or successes.numel() != total_rows:
     raise ValueError("Expected one metadata value per stored state")
 
-  # Validate episode labels and identify levels with eligible windows.
-  eligible_episodes = sorted({episode for episode, _ in dataset.clip_indices})
+  eligible_episodes = sorted({episode for episode, _ in dataset.clip_indices})  # episodes that produced at least one window
   metadata = {}
 
   for episode in eligible_episodes:
@@ -312,7 +354,7 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
     if (success_value not in (0.0, 1.0) or not (episode_successes == success_value).all().item()):
       raise ValueError(f"Episode {episode}: success label must be consistently 0 or 1")
 
-    metadata[episode] = (int(level_value), bool(success_value))
+    metadata[episode] = (int(level_value), bool(success_value))  # one clean (level, success) per episode
 
   # Positions here refer to train_set, not the full dataset.
   episode_positions = {}
@@ -365,71 +407,48 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
 
   return torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=len(train_indices), replacement=True, generator=torch.Generator().manual_seed(seed), )
 
+def lewm_forward(self, batch, stage, cfg, ):
+  """
+  The LeWM training/validation step: encode 4 states, predict the next 3 latents, score them.
 
-def build_dataloaders(dataset, cfg: DictConfig):
-  train_fraction = cfg.train_split
-  val_fraction = cfg.val_split
+  GETS:    self  -- the stable-pretraining Module wrapper. Holds self.model (the JEPA),
+                    self.sigreg (the SIGReg regularizer), and self.training (train vs eval flag).
+           batch -- one DataLoader batch, already transformed:
+                    {"pixels":[B,4,3,224,224], "action":[B,4,9], "grid":[B,4,4096] (unused here)}.
+                    The 4 = history_size(3) + num_preds(1); action a_t is the action taken IN state s_t.
+           stage -- "fit"/"validate" (unused here, branch on self.training instead).
+           cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.sigreg.*.
+  DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
+           JEPA.predict -> predicted next latents;
+           Logs train scalars every step, or full world-model metrics once per val epoch.
+  RETURNS: {"loss", "pred_loss", "sigreg_loss"} -- spt backprops on "loss".
+  """
+  history_size = cfg.wm.history_size
+  num_preds = cfg.wm.num_preds
 
-  if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and train_fraction + val_fraction < 1):
-    raise ValueError("train_split and val_split must be positive and sum to less than 1")
+  # ViT treats all 4 frames as independent images - the encoder never sees context, the predictor does
+  output = self.model.encode(batch)  # JEPA.encode flattens [B,4,...] -> [B*4,...], runs the ViT + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
+  embeddings = output["emb"]  # z0..z3   [B, 4, 192]
+  action_embeddings = output["act_emb"]  # e(a0)..e(a3)  [B, 4, 192]
 
-  # Include only episodes that supply at least one SWM window.
-  episode_ids = sorted({episode for episode, _ in dataset.clip_indices})
+  context_embeddings = embeddings[:, :history_size, ]
+  context_actions = action_embeddings[:, :history_size, ]
+  targets = embeddings[:, num_preds:, ]  #NOT detached. Gradient flows into targets too, so the encoder is trained by BOTH the predictor's error AND the target side.
 
-  generator = torch.Generator().manual_seed(cfg.seed)
-  order = torch.randperm(len(episode_ids), generator=generator).tolist()
-  episode_ids = [episode_ids[index] for index in order]
+  predictions = self.model.predict(context_embeddings, context_actions, )  # causal transformer - has to learn to predict with more and less context
+  prediction_loss = (predictions - targets).pow(2).mean()
 
-  num_train = int(len(episode_ids) * train_fraction)
-  num_val = int(len(episode_ids) * val_fraction)
-  num_test = len(episode_ids) - num_train - num_val
+  # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames) instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
+  # sigreg_loss = self.sigreg(embeddings.transpose(0, 1))  # raw LeWM: SIGReg on the embeddings themselves
+  sigreg_loss = self.sigreg((embeddings - embeddings.mean(dim=1, keepdim=True)).transpose(0, 1))  # [B, T, D] -> [T, B, D] 
+  loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss)
 
-  if min(num_train, num_val, num_test) < 1:
-    raise ValueError("Not enough eligible episodes for these split proportions")
-
-  episode_groups = (episode_ids[:num_train], episode_ids[num_train:num_train + num_val], episode_ids[num_train + num_val:], )
-
-  # Map each episode to one split: 0=train, 1=val, 2=test.
-  episode_to_split = {}
-  for split_index, episodes in enumerate(episode_groups):
-    for episode in episodes:
-      episode_to_split[episode] = split_index
-
-  # Assign every window according to its episode.
-  window_groups = [[], [], []]
-  for window_index, (episode, _) in enumerate(dataset.clip_indices):
-    split_index = episode_to_split[episode]
-    window_groups[split_index].append(window_index)
-
-  train_set, val_set, test_set = [torch.utils.data.Subset(dataset, indices) for indices in window_groups]
-
-  for name, episodes, indices in zip(("train", "val", "test"), episode_groups, window_groups):
-    print(f"{name}: {len(episodes)} episodes, {len(indices)} windows")
-  loader_cfg = OmegaConf.to_container(cfg.loader, resolve=True)
-  sampling_cfg = cfg.get("sampling")
-
-  if sampling_cfg is not None:
-    sampler = build_arc_sampler(dataset=dataset, train_indices=window_groups[0], success_probability_sampling=sampling_cfg.success_probability_sampling, seed=int(cfg.seed) + 1, )
-
-    train_loader_cfg = dict(loader_cfg)
-
-    # The sampler controls sample selection and order.
-    train_loader_cfg.pop("shuffle", None)
-
-    train_loader = torch.utils.data.DataLoader(train_set, **train_loader_cfg, sampler=sampler, generator=generator, )
-  else:
-    train_loader = torch.utils.data.DataLoader(train_set, **loader_cfg, generator=generator, )
-
-  eval_loader_cfg = dict(loader_cfg)
-  eval_loader_cfg["shuffle"] = False
-  eval_loader_cfg["drop_last"] = False
-
-  # Shuffled so each batch mixes episodes; otherwise batch statistics (SIGReg, batch_latent_std) are inflated by consecutive windows of one episode.
-  val_loader = torch.utils.data.DataLoader(val_set, **{**eval_loader_cfg, "shuffle": True}, generator=generator, )
-  test_loader = torch.utils.data.DataLoader(test_set, **eval_loader_cfg)
-
-  return train_loader, val_loader, test_loader
-
+  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(4 states)
+    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+  else:  # validation: one value per epoch
+    metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
+    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
+  return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name=None)
 def main(cfg: DictConfig) -> None:
@@ -522,7 +541,7 @@ def main(cfg: DictConfig) -> None:
   logger.save()  # flush the TensorBoard events first, os._exit skips all cleanup
   print(f"Training complete: {run_dir}")
   os._exit(0)
-
+Œ
 
 if __name__ == "__main__":
   main()

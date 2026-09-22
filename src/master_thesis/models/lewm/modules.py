@@ -9,7 +9,6 @@ def modulate(x, shift, scale):
 
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
-
     def __init__(self, knots=17, num_proj=1024):
         super().__init__()
         self.num_proj = num_proj
@@ -52,10 +51,8 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-
 class Attention(nn.Module):
     """Scaled dot-product attention with causal masking"""
-
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
@@ -84,7 +81,6 @@ class Attention(nn.Module):
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
-
 class ConditionalBlock(nn.Module):
     """Transformer block with AdaLN-zero conditioning"""
 
@@ -110,7 +106,6 @@ class ConditionalBlock(nn.Module):
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
-
 class Block(nn.Module):
     """Standard Transformer block"""
 
@@ -127,10 +122,8 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-
 class Transformer(nn.Module):
     """Standard Transformer with support for AdaLN-zero blocks"""
-
     def __init__(
         self,
         input_dim,
@@ -213,7 +206,6 @@ class Embedder(nn.Module):
         x = self.embed(x)
         return x
 
-
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation"""
 
@@ -239,7 +231,6 @@ class MLP(nn.Module):
         x: (B*T, D)
         """
         return self.net(x)
-
 
 class ARPredictor(nn.Module):
     """Autoregressive predictor for next-step embedding prediction."""
