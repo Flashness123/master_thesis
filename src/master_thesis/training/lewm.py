@@ -435,20 +435,32 @@ def lewm_forward(self, batch, stage, cfg, ):
   context_actions = action_embeddings[:, :history_size, ]
   targets = embeddings[:, num_preds:, ]  #NOT detached. Gradient flows into targets too, so the encoder is trained by BOTH the predictor's error AND the target side.
 
-  predictions = self.model.predict(context_embeddings, context_actions, )  # causal transformer - has to learn to predict with more and less context
+  predictions = self.model.predict(context_embeddings, context_actions) #context_actions  # causal transformer - has to learn to predict with more and less context
   prediction_loss = (predictions - targets).pow(2).mean()
+
+  # Delta-JEPA (Zhang et al. 2026, arXiv:2606.31232): a decoder has to name the action from the latent difference alone,
+  # which punishes actions that look alike in latent space - exactly the weakness we measured (tiny action_gap).
+  action_logits = self.model.decode_action(embeddings[:, :-1], embeddings[:, 1:])  # [B, 3, 7]: one guess per transition z_t -> z_t+1 in the window
+  one_hot = batch["action"][:, :-1, :7]  # the 7-way one-hot part of the 9-D action vector; a_t is the action taken IN state s_t, so it matches transition t
+  action_targets = one_hot.argmax(dim=-1).masked_fill(one_hot.sum(dim=-1) == 0, -1)  # class 0..6; an all-zero one-hot is the synthetic end-of-episode action -> -1 = ignored
+
+  changed_cells = (batch["grid"][:, 1:] != batch["grid"][:, :-1]).sum(dim=-1)  # [B, 3]: how much of the screen each transition changed
+  action_targets = action_targets.masked_fill(changed_cells <= cfg.loss.action.min_changed_cells, -1)  # blocked moves look identical whichever direction was pressed, so asking for the action there only teaches noise
+  action_loss = F.cross_entropy(action_logits.flatten(0, 1), action_targets.flatten(), ignore_index=-1) if (action_targets >= 0).any() else action_logits.sum() * 0  # a batch without a single usable transition would give NaN
 
   # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames) instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
   # sigreg_loss = self.sigreg(embeddings.transpose(0, 1))  # raw LeWM: SIGReg on the embeddings themselves
   sigreg_loss = self.sigreg((embeddings - embeddings.mean(dim=1, keepdim=True)).transpose(0, 1))  # [B, T, D] -> [T, B, D] 
-  loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss)
+  loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss + cfg.loss.action.weight * action_loss)
 
   if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(4 states)
-    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
   else:  # validation: one value per epoch
     metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
-    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
-  return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, }
+    valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
+    action_accuracy = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
+    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), "val/action_loss": action_loss.detach(), "val/action_accuracy": action_accuracy, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
+  return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, "action_loss": action_loss, }
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name=None)
 def main(cfg: DictConfig) -> None:
@@ -541,7 +553,6 @@ def main(cfg: DictConfig) -> None:
   logger.save()  # flush the TensorBoard events first, os._exit skips all cleanup
   print(f"Training complete: {run_dir}")
   os._exit(0)
-Œ
 
 if __name__ == "__main__":
   main()

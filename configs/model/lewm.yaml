@@ -29,6 +29,11 @@ action_encoder:
   input_dim: ???  # Filled automatically from the dataset/action configuration.
   emb_dim: ${embed_dim}
 
+action_decoder:  # Delta-JEPA (arXiv:2606.31232): recovers the executed action from the latent difference z_t+1 - z_t; remove this block for plain LeWM
+  _target_: master_thesis.models.lewm.MLP
+  input_dim: ${embed_dim}
+  hidden_dim: 512
+  output_dim: 7  # ACTION1..ACTION7 (the 7-way one-hot part of the 9-D action vector)
 
 projector:
   _target_: master_thesis.models.lewm.MLP

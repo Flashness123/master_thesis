@@ -21,12 +21,13 @@ class JEPA(nn.Module):
   Training uses only encode() + predict() 
   Inference uses CEM = rollout()/criterion()/get_cost()
   """
-  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, ):
+  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, ):
     super().__init__()
 
     self.encoder = encoder
     self.predictor = predictor
     self.action_encoder = action_encoder
+    self.action_decoder = action_decoder  # Delta-JEPA's LDAD (optional): names the action behind a latent difference. None = plain LeWM, so older runs still load.
     self.projector = projector or nn.Identity()  # 192->2048->192  optional: fall back to a no-op if not configured, but they are configured by ARC config
     self.pred_proj = pred_proj or nn.Identity()  # 192->2048->192
 
@@ -68,6 +69,22 @@ class JEPA(nn.Module):
     preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))  # pred_proj is an MLP over the feature dim only, so flatten (B,T) to apply it per-token, then restore
     preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
     return preds
+
+  def decode_action(self, emb, next_emb):
+    """
+    Delta-JEPA's Latent Difference Action Decoder (Zhang et al. 2026, arXiv:2606.31232).
+
+    GETS:    emb      -- latents of the states the actions were taken in  [B, T, 192]  (z_t).
+             next_emb -- latents of the states they led to                [B, T, 192]  (z_t+1).
+    DOES:    form the displacement z_t+1 - z_t and classify the action from THAT ALONE. The decoder never
+             sees z_t itself, so the action cannot be read off state-specific cues: the only way to solve the
+             task is for different actions to move the latent in distinguishable directions (the paper's point,
+             and its ablation shows this beats decoding from the two endpoints).
+    RETURNS: action logits [B, T, num_actions] (for ARC: 7 = ACTION1..ACTION7).
+    """
+    delta = next_emb - emb  # the encoder gets this gradient: it is what shapes the transition geometry
+    logits = self.action_decoder(rearrange(delta, "b t d -> (b t) d"))  # the decoder is an MLP over the feature dim, so flatten (B,T) as in predict()
+    return rearrange(logits, "(b t) a -> b t a", b=emb.size(0))
 
   ####################
   ## Inference only ##
