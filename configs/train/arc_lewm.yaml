@@ -37,7 +37,8 @@ sampling:
 
 wm:
   history_size: 3
-  num_preds: 1
+  # num_preds: 1  # one-step teacher-forced loss (all runs up to ls20_multi-no-l3_delta_warm300k), windows of history_size + 1 = 4 frames
+  num_preds: 5  # K: steps imagined from one real frame in the rollout loss; windows are 1 + K = 6 frames
 
 trainer:
   max_epochs: 100
@@ -70,6 +71,8 @@ optimizer:
 
 
 loss:
+  rollout:
+    discount: 0.95  # gamma: step k of the rollout loss is weighted by gamma^(k-1) (Semigroup-JEPA's best value)
   action:
     weight: 0.5  # lambda of Delta-JEPA's action loss; 0 = plain LeWM. Chosen so the action term (~0.5 * 0.6 at convergence) is the same order as the SIGReg term (0.09 * ~1.7);
                 # the paper's 10-50 is for an MSE on continuous actions, ours is a cross-entropy that starts near ln 7 = 1.95

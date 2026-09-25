@@ -86,6 +86,23 @@ class JEPA(nn.Module):
     logits = self.action_decoder(rearrange(delta, "b t d -> (b t) d"))  # the decoder is an MLP over the feature dim, so flatten (B,T) as in predict()
     return rearrange(logits, "(b t) a -> b t a", b=emb.size(0))
 
+  def predict_rollout(self, emb, act_emb, history_size: int = 3):
+    """
+    Imagine the future autoregressively, WITH gradients (the training counterpart of rollout(), which the planner uses).
+
+    GETS:    emb          -- the real starting latents [B, T0, 192] (in training: only z0, as the planner starts from one frame).
+             act_emb      -- action latents [B, T0 + K - 1, 192]: e(a_i) is the action taken in state i, one per latent to feed in.
+             history_size -- the predictor sees at most this many latents; older ones drop out, exactly as in rollout().
+    DOES:    predict the next latent from the last `history_size` latents and their actions, append it, repeat K times.
+    RETURNS: the K imagined latents [B, K, 192] (in training: ẑ1..ẑK).
+    """
+    start = emb.size(1)
+    for _ in range(act_emb.size(1) - start + 1):
+      n = emb.size(1)  # latents so far: real ones, then our own predictions
+      next_emb = self.predict(emb[:, -history_size:], act_emb[:, :n][:, -history_size:])[:, -1:]  # the last position predicts the next state
+      emb = torch.cat([emb, next_emb], dim=1)  # feed the prediction back in
+    return emb[:, start:]
+
   ####################
   ## Inference only ##
   ####################

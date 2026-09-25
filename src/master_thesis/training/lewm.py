@@ -194,13 +194,13 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows a
   Open one Lance dataset as overlapping fixed-length windows and wire the transforms onto it.
 
   GETS:    cfg -- the resolved Hydra config. Uses cfg.data.* (which Lance table, frameskip,
-           which columns), cfg.wm.history_size + cfg.wm.num_preds (window length), cfg.img_size.
+           which columns), 1 + cfg.wm.num_preds (window length), cfg.img_size.
   DOES:    load_dataset gives a windowed view of the table; then attach ArcGridToPixels and
            ArcActionEncoding as the per-sample transform; then record the action dim back into cfg.
   RETURNS: a stable-worldmodel dataset whose __getitem__ yields one window as
            {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
            {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
-           (T = history_size + num_preds = 4.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
+           (T = 1 + num_preds = 6: one real frame + K imagined steps.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
   """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
     raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
@@ -208,7 +208,7 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows a
   dataset_name = cfg.data.name
   dataset = swm.data.load_dataset(dataset_name, transform=None,  # The windowing call (stable-worldmodel, not our code). num_steps=4 means every sample is 4 consecutive states of ONE episode; consecutive windows overlap (slide by 1). This is why a 41-state episode yields 38 windows. frameskip=1 -> no frames skipped (one ARC step = one transition).
                                   frameskip=cfg.data.frameskip, 
-                                  num_steps=(cfg.wm.history_size + cfg.wm.num_preds), 
+                                  num_steps=(1 + cfg.wm.num_preds),  # was history_size + num_preds (= 4) for the one-step loss; the rollout loss needs 1 real frame + K targets 
                                   keys_to_load=list(cfg.data.keys_to_load), ) 
 
   grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))  # [4096]->[3,224,224]
@@ -409,13 +409,13 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
 
 def lewm_forward(self, batch, stage, cfg, ):
   """
-  The LeWM training/validation step: encode 4 states, predict the next 3 latents, score them.
+  The LeWM training/validation step: encode 1 + K states, imagine K steps from the first one, score them.
 
   GETS:    self  -- the stable-pretraining Module wrapper. Holds self.model (the JEPA),
                     self.sigreg (the SIGReg regularizer), and self.training (train vs eval flag).
            batch -- one DataLoader batch, already transformed:
-                    {"pixels":[B,4,3,224,224], "action":[B,4,9], "grid":[B,4,4096] (unused here)}.
-                    The 4 = history_size(3) + num_preds(1); action a_t is the action taken IN state s_t.
+                    {"pixels":[B,K+1,3,224,224], "action":[B,K+1,9], "grid":[B,K+1,4096]}.
+                    K = wm.num_preds (5); action a_t is the action taken IN state s_t.
            stage -- "fit"/"validate" (unused here, branch on self.training instead).
            cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.sigreg.*.
   DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
@@ -424,27 +424,35 @@ def lewm_forward(self, batch, stage, cfg, ):
   RETURNS: {"loss", "pred_loss", "sigreg_loss"} -- spt backprops on "loss".
   """
   history_size = cfg.wm.history_size
-  num_preds = cfg.wm.num_preds
+  num_preds = cfg.wm.num_preds  # K: steps imagined per window; the window is 1 real frame + K frames
 
-  # ViT treats all 4 frames as independent images - the encoder never sees context, the predictor does
-  output = self.model.encode(batch)  # JEPA.encode flattens [B,4,...] -> [B*4,...], runs the ViT + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
-  embeddings = output["emb"]  # z0..z3   [B, 4, 192]
-  action_embeddings = output["act_emb"]  # e(a0)..e(a3)  [B, 4, 192]
+  # ViT treats all frames as independent images - the encoder never sees context, the predictor does
+  output = self.model.encode(batch)  # JEPA.encode flattens [B,T,...] -> [B*T,...], runs the ViT + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
+  embeddings = output["emb"]  # z0..zK   [B, K+1, 192]
+  action_embeddings = output["act_emb"]  # e(a0)..e(aK)  [B, K+1, 192]
 
-  context_embeddings = embeddings[:, :history_size, ]
-  context_actions = action_embeddings[:, :history_size, ]
-  targets = embeddings[:, num_preds:, ]  #NOT detached. Gradient flows into targets too, so the encoder is trained by BOTH the predictor's error AND the target side.
+  # Old one-step teacher-forced loss (LeWM), replaced by the rollout loss below:
+  # context_embeddings = embeddings[:, :history_size, ]
+  # context_actions = action_embeddings[:, :history_size, ]
+  # targets = embeddings[:, num_preds:, ]
+  # predictions = self.model.predict(context_embeddings, context_actions)
+  # prediction_loss = (predictions - targets).pow(2).mean()
 
-  predictions = self.model.predict(context_embeddings, context_actions) #context_actions  # causal transformer - has to learn to predict with more and less context
-  prediction_loss = (predictions - targets).pow(2).mean()
+  # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from the ONE real z0, feeding predictions back,
+  # exactly as the planner does; the error at every step flows back into predictor AND encoder, so the encoder has to keep what the predictor needs to carry forward.
+  # (The paper starts from H real frames; we start from one because our planner does.)
+  predictions = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
+  step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
+  weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
+  prediction_loss = (weights / weights.sum() * step_errors).sum()  # normalized, so the loss keeps the scale of a single-step MSE
 
   # Delta-JEPA (Zhang et al. 2026, arXiv:2606.31232): a decoder has to name the action from the latent difference alone,
   # which punishes actions that look alike in latent space - exactly the weakness we measured (tiny action_gap).
-  action_logits = self.model.decode_action(embeddings[:, :-1], embeddings[:, 1:])  # [B, 3, 7]: one guess per transition z_t -> z_t+1 in the window
+  action_logits = self.model.decode_action(embeddings[:, :-1], embeddings[:, 1:])  # [B, K, 7]: one guess per real transition z_t -> z_t+1 in the window
   one_hot = batch["action"][:, :-1, :7]  # the 7-way one-hot part of the 9-D action vector; a_t is the action taken IN state s_t, so it matches transition t
   action_targets = one_hot.argmax(dim=-1).masked_fill(one_hot.sum(dim=-1) == 0, -1)  # class 0..6; an all-zero one-hot is the synthetic end-of-episode action -> -1 = ignored
 
-  changed_cells = (batch["grid"][:, 1:] != batch["grid"][:, :-1]).sum(dim=-1)  # [B, 3]: how much of the screen each transition changed
+  changed_cells = (batch["grid"][:, 1:] != batch["grid"][:, :-1]).sum(dim=-1)  # [B, K]: how much of the screen each transition changed
   action_targets = action_targets.masked_fill(changed_cells <= cfg.loss.action.min_changed_cells, -1)  # blocked moves look identical whichever direction was pressed, so asking for the action there only teaches noise
   action_loss = F.cross_entropy(action_logits.flatten(0, 1), action_targets.flatten(), ignore_index=-1) if (action_targets >= 0).any() else action_logits.sum() * 0  # a batch without a single usable transition would give NaN
 
@@ -453,13 +461,20 @@ def lewm_forward(self, batch, stage, cfg, ):
   sigreg_loss = self.sigreg((embeddings - embeddings.mean(dim=1, keepdim=True)).transpose(0, 1))  # [B, T, D] -> [T, B, D] 
   loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss + cfg.loss.action.weight * action_loss)
 
-  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(4 states)
-    self.log_dict({"train/loss": loss.detach(), "train/pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(1 + K states)
+    self.log_dict({"train/loss": loss.detach(), "train/rollout_pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
   else:  # validation: one value per epoch
-    metrics = world_model_metrics(model=self.model, embeddings=embeddings, context_embeddings=context_embeddings, context_actions=context_actions, targets=targets, predictions=predictions, actions=batch["action"], )
+    # The earlier val/* metrics, computed as before on the first 4 frames of the window, so the curves stay comparable with older runs.
+    # Note: their teacher-forced part (3 REAL frames as history) is a situation this model is no longer trained on.
+    context_embeddings, context_actions = embeddings[:, :history_size], action_embeddings[:, :history_size]
+    teacher_forced = self.model.predict(context_embeddings, context_actions)
+    metrics = world_model_metrics(model=self.model, embeddings=embeddings[:, :history_size + 1], context_embeddings=context_embeddings, context_actions=context_actions, targets=embeddings[:, 1:history_size + 1], predictions=teacher_forced, actions=batch["action"][:, :history_size + 1], )
+    metrics["pred_loss"] = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean()  # the old val/pred_loss: one-step teacher-forced MSE
+    stay = (embeddings[:, 1:] - embeddings[:, :1]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays z0"
+    metrics.update({f"rollout_k{k + 1}": step_errors[k] / stay[k] for k in range(num_preds)})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
     valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
     action_accuracy = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
-    self.log_dict({"val/loss": loss.detach(), "val/pred_loss": prediction_loss.detach(), "val/action_loss": action_loss.detach(), "val/action_accuracy": action_accuracy, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
+    self.log_dict({"val/loss": loss.detach(), "val/rollout_pred_loss": prediction_loss.detach(), "val/action_loss": action_loss.detach(), "val/action_accuracy": action_accuracy, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
   return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, "action_loss": action_loss, }
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name=None)
