@@ -17,6 +17,7 @@ from pathlib import Path
 from PIL import Image
 from tensorboard.compat.proto.summary_pb2 import Summary
 from master_thesis.models.lewm import SIGReg
+from master_thesis.models.lewm.opf import audit_basis_geometry, audit_factor_geometry, encoder_variance_loss, factor_activity_loss, factor_prediction_loss, projector_orthogonality_loss
 from master_thesis.paths import model_dir, stablewm_home, timestamp
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -417,11 +418,13 @@ def lewm_forward(self, batch, stage, cfg, ):
                     {"pixels":[B,K+1,3,224,224], "action":[B,K+1,9], "grid":[B,K+1,4096]}.
                     K = wm.num_preds (5); action a_t is the action taken IN state s_t.
            stage -- "fit"/"validate" (unused here, branch on self.training instead).
-           cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.sigreg.*.
+           cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.rollout/action/sigreg.*, loss.opf.* (only with OPF).
   DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
-           JEPA.predict -> predicted next latents;
+           JEPA.predict_rollout -> predicted next latents;
+           with OPF (model=lewm_opf): the per-step error is measured between predicted and target factors, and
+           OPF's orthogonality / factor-activity / encoder-variance regularizers are added.
            Logs train scalars every step, or full world-model metrics once per val epoch.
-  RETURNS: {"loss", "pred_loss", "sigreg_loss"} -- spt backprops on "loss".
+  RETURNS: {"loss", "pred_loss", "sigreg_loss", "action_loss"} -- spt backprops on "loss".
   """
   history_size = cfg.wm.history_size
   num_preds = cfg.wm.num_preds  # K: steps imagined per window; the window is 1 real frame + K frames
@@ -441,8 +444,13 @@ def lewm_forward(self, batch, stage, cfg, ):
   # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from the ONE real z0, feeding predictions back,
   # exactly as the planner does; the error at every step flows back into predictor AND encoder, so the encoder has to keep what the predictor needs to carry forward.
   # (The paper starts from H real frames; we start from one because our planner does.)
-  predictions = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
-  step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
+  predictions, predicted_factors = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
+  full_step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
+  if predicted_factors is None:
+    step_errors = full_step_errors
+  else:
+    target_factors = self.model.analyze_target(embeddings[:, 1:])  # [B, K, num_factors, r]; no EMA / stop-gradient, unlike the paper
+    step_errors = torch.stack([factor_prediction_loss(predicted_factors[:, k], target_factors[:, k]) for k in range(num_preds)])  # L_pred per rollout step, discounted below (the paper: one flat mean)
   weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
   prediction_loss = (weights / weights.sum() * step_errors).sum()  # normalized, so the loss keeps the scale of a single-step MSE
 
@@ -461,8 +469,19 @@ def lewm_forward(self, batch, stage, cfg, ):
   sigreg_loss = self.sigreg((embeddings - embeddings.mean(dim=1, keepdim=True)).transpose(0, 1))  # [B, T, D] -> [T, B, D] 
   loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss + cfg.loss.action.weight * action_loss)
 
+  # OPF (JEPA-Anything, Cui et al. 2026, arXiv:2609.20800): the three regularizers of the paper's Eq. "objective"
+  opf_losses = {}
+  if self.model.opf is not None:
+    opf_cfg = cfg.loss.opf
+    opf_losses = {
+      "orthogonality": projector_orthogonality_loss(self.model.opf.basis),
+      "factor_activity": factor_activity_loss(target_factors, min_std=opf_cfg.factor_min_std),
+      "encoder_variance": encoder_variance_loss(embeddings, min_std=opf_cfg.encoder_min_std),  # all frames: without an EMA target encoder every latent comes from the online encoder
+    }
+    loss = loss + opf_cfg.orthogonality_weight * opf_losses["orthogonality"] + opf_cfg.factor_activity_weight * opf_losses["factor_activity"] + opf_cfg.encoder_variance_weight * opf_losses["encoder_variance"]
+
   if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(1 + K states)
-    self.log_dict({"train/loss": loss.detach(), "train/rollout_pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+    self.log_dict({"train/loss": loss.detach(), "train/rollout_pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), **{f"train/opf_{name}_loss": value.detach() for name, value in opf_losses.items()}, }, on_step=True, on_epoch=False, sync_dist=True, )
   else:  # validation: one value per epoch
     # The earlier val/* metrics, computed as before on the first 4 frames of the window, so the curves stay comparable with older runs.
     # Note: their teacher-forced part (3 REAL frames as history) is a situation this model is no longer trained on.
@@ -471,7 +490,11 @@ def lewm_forward(self, batch, stage, cfg, ):
     metrics = world_model_metrics(model=self.model, embeddings=embeddings[:, :history_size + 1], context_embeddings=context_embeddings, context_actions=context_actions, targets=embeddings[:, 1:history_size + 1], predictions=teacher_forced, actions=batch["action"][:, :history_size + 1], )
     metrics["pred_loss"] = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean()  # the old val/pred_loss: one-step teacher-forced MSE
     stay = (embeddings[:, 1:] - embeddings[:, :1]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays z0"
-    metrics.update({f"rollout_k{k + 1}": step_errors[k] / stay[k] for k in range(num_preds)})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
+    metrics.update({f"rollout_k{k + 1}": full_step_errors[k] / stay[k] for k in range(num_preds)})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still); always in latent space, so runs with and without OPF compare
+    if self.model.opf is not None:
+      metrics.update({f"opf_{name}_loss": value for name, value in opf_losses.items()})
+      metrics.update({f"opf_{name}": value for name, value in audit_basis_geometry(self.model.opf.basis).items()})
+      metrics.update({f"opf_{name}": value for name, value in audit_factor_geometry(target_factors, min_standard_deviation=cfg.loss.opf.factor_min_std).items()})
     valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
     action_accuracy = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
     self.log_dict({"val/loss": loss.detach(), "val/rollout_pred_loss": prediction_loss.detach(), "val/action_loss": action_loss.detach(), "val/action_accuracy": action_accuracy, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging

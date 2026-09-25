@@ -17,12 +17,20 @@ class JEPA(nn.Module):
     predictor      -- ARPredictor; causal transformer, predicts the next state latent given history+actions.
     projector      -- MLP 192->2048->192 (BatchNorm); post-processes the CLS token into the state latent.
     pred_proj      -- MLP 192->2048->192; post-processes the predictor's output.
+    opf            -- optional OrthogonalFactorProjection (JEPA-Anything); together with factor_heads it
+    factor_heads      replaces pred_proj: K heads predict K factors, opf synthesizes the latent from them.
 
-  Training uses only encode() + predict() 
+  Training uses only encode() + predict()
   Inference uses CEM = rollout()/criterion()/get_cost()
   """
-  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, ):
+  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, opf=None, factor_heads=None, ):
     super().__init__()
+    if (opf is None) != (factor_heads is None):
+      raise ValueError("opf and factor_heads are configured together (configs/model/lewm_opf.yaml)")
+    if opf is not None and pred_proj is not None:
+      raise ValueError("OPF replaces pred_proj: set pred_proj to null when opf is configured")
+    if opf is not None and (factor_heads.num_factors, factor_heads.factor_dim) != (opf.num_factors, opf.factor_dim):
+      raise ValueError("factor_heads and opf must use the same factorization")
 
     self.encoder = encoder
     self.predictor = predictor
@@ -30,6 +38,8 @@ class JEPA(nn.Module):
     self.action_decoder = action_decoder  # Delta-JEPA's LDAD (optional): names the action behind a latent difference. None = plain LeWM, so older runs still load.
     self.projector = projector or nn.Identity()  # 192->2048->192  optional: fall back to a no-op if not configured, but they are configured by ARC config
     self.pred_proj = pred_proj or nn.Identity()  # 192->2048->192
+    self.opf = opf
+    self.factor_heads = factor_heads
 
   def encode(self, info):
     """
@@ -63,12 +73,50 @@ class JEPA(nn.Module):
              act_emb -- action latents  [B, T, 192]  (the 3 action latents e(a0),e(a1),e(a2)).
     DOES:    run the causal ARPredictor (position t attends to 0..t, conditioned on actions via AdaLN),
              then post-project each output through pred_proj.
+             With OPF instead: synthesize_complete_state(predict_factors(...)).
     RETURNS: predicted next-state latents [B, T, 192]. Position t = the prediction of state t+1.
     """
+    if self.opf is not None:
+      return self.synthesize_complete_state(self.predict_factors(emb, act_emb))
     preds = self.predictor(emb, act_emb)
     preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))  # pred_proj is an MLP over the feature dim only, so flatten (B,T) to apply it per-token, then restore
     preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
     return preds
+
+  def predict_factors(self, emb, act_emb):
+    """
+    OPF: predict every factor of the next-state latent (JEPA-Anything's predict_factors).
+
+    GETS:    emb, act_emb as in predict(). In the paper's terms emb is the context embedding and act_emb the
+             exogenous input; there is no target descriptor, because the target is always the next state.
+    DOES:    runs the ARPredictor (shared trunk), then FactorHeads (one head q_k per factor).
+    RETURNS: predicted factors [B, T, num_factors, r]. Position t = the factors of state t+1.
+    """
+    hidden = self.predictor(emb, act_emb)
+    factors = self.factor_heads(rearrange(hidden, "b t d -> (b t) d"))
+    return rearrange(factors, "(b t) k r -> b t k r", b=emb.size(0))
+
+  def synthesize_complete_state(self, factor_blocks):
+    """
+    OPF: turn predicted factors into a complete latent (JEPA-Anything's synthesize_complete_state).
+
+    GETS:    factor_blocks [..., num_factors, r].
+    DOES:    OrthogonalFactorProjection.compose(): pseudoinverse synthesis, computed in float32.
+    RETURNS: latents [..., 192] in the dtype of factor_blocks, so predict() returns the same dtype with and without OPF.
+    """
+    return self.opf.compose(factor_blocks).to(factor_blocks.dtype)
+
+  def analyze_target(self, target_embedding):
+    """
+    OPF: split target latents into their factors (JEPA-Anything's analyze_target).
+
+    GETS:    target_embedding [..., 192].
+    DOES:    OrthogonalFactorProjection.decompose(): z^(k) = P_k^T z.
+             Unlike the paper there is no EMA target encoder and no stop-gradient: the targets come from the same
+             encoder and stay attached, as in the rest of our loss.
+    RETURNS: target factors [..., num_factors, r] in float32.
+    """
+    return self.opf.decompose(target_embedding)
 
   def decode_action(self, emb, next_emb):
     """
@@ -94,14 +142,22 @@ class JEPA(nn.Module):
              act_emb      -- action latents [B, T0 + K - 1, 192]: e(a_i) is the action taken in state i, one per latent to feed in.
              history_size -- the predictor sees at most this many latents; older ones drop out, exactly as in rollout().
     DOES:    predict the next latent from the last `history_size` latents and their actions, append it, repeat K times.
-    RETURNS: the K imagined latents [B, K, 192] (in training: ẑ1..ẑK).
+    RETURNS: (the K imagined latents [B, K, 192] (in training: ẑ1..ẑK),
+              their OPF factors [B, K, num_factors, r] or None without OPF).
     """
     start = emb.size(1)
+    factors = []
     for _ in range(act_emb.size(1) - start + 1):
       n = emb.size(1)  # latents so far: real ones, then our own predictions
-      next_emb = self.predict(emb[:, -history_size:], act_emb[:, :n][:, -history_size:])[:, -1:]  # the last position predicts the next state
+      context, actions = emb[:, -history_size:], act_emb[:, :n][:, -history_size:]
+      if self.opf is None:
+        next_emb = self.predict(context, actions)[:, -1:]  # the last position predicts the next state
+      else:
+        next_factors = self.predict_factors(context, actions)[:, -1:]
+        factors.append(next_factors)
+        next_emb = self.synthesize_complete_state(next_factors)
       emb = torch.cat([emb, next_emb], dim=1)  # feed the prediction back in
-    return emb[:, start:]
+    return emb[:, start:], (torch.cat(factors, dim=1) if factors else None)
 
   ####################
   ## Inference only ##

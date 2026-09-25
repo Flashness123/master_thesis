@@ -1,0 +1,25 @@
+# LeWM + Orthogonal Predictive Factorization (JEPA-Anything, arXiv:2609.20800). Select with: model=lewm_opf
+# Everything is taken from lewm.yaml; only pred_proj is replaced by one head per factor + pseudoinverse synthesis.
+# Controls:  model.opf.learnable=false            fixed identity P (factor k = latent coordinates [k*r, (k+1)*r))
+#            loss.opf.orthogonality_weight=0      learnable P without the orthogonality constraint (unconstrained heads)
+defaults:
+  - lewm
+  - _self_
+
+pred_proj: null
+
+opf:
+  _target_: master_thesis.models.lewm.OrthogonalFactorProjection
+  state_dim: ${embed_dim}
+  num_factors: 4  # K; the latent stays 192-dim, cut into 4 factors of r = 192 / 4 = 48 coordinates
+  learnable: true  # the class default is false (fixed basis), as in the original
+
+factor_heads:
+  _target_: master_thesis.models.lewm.FactorHeads
+  input_dim: ${embed_dim}
+  state_dim: ${embed_dim}
+  num_factors: ${model.opf.num_factors}
+  hidden_dim: 816  # 4 heads x 816 hidden ≈ the parameters of pred_proj (one head, 2048 hidden), so both variants are the same size
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

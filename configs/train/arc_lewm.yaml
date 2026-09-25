@@ -78,6 +78,12 @@ loss:
                 # the paper's 10-50 is for an MSE on continuous actions, ours is a cross-entropy that starts near ln 7 = 1.95
     min_changed_cells: 10  # skip transitions that changed at most this many cells: in ls20 those are blocked moves where only the step counter advanced,
                            # so left and right give the SAME next grid and no decoder can tell them apart (35% of transitions; ceiling 0.76 if kept). 0 = use every transition
+  opf:  # used only with model=lewm_opf; names = jepa_anything_objective's arguments, values = the paper's for all its world-model tasks
+    orthogonality_weight: 0.10  # lambda_orth; 0 = unconstrained heads (control)
+    factor_activity_weight: 0.05  # lambda_fac
+    encoder_variance_weight: 0.02  # lambda_enc
+    factor_min_std: 0.1  # gamma_fac
+    encoder_min_std: 0.1  # gamma_enc
   sigreg:
     weight: 0.09
     kwargs:
