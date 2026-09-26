@@ -421,8 +421,9 @@ def lewm_forward(self, batch, stage, cfg, ):
            cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.rollout/action/sigreg.*, loss.opf.* (only with OPF).
   DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
            JEPA.predict_rollout -> predicted next latents;
-           with OPF (model=lewm_opf): the per-step error is measured between predicted and target factors, and
-           OPF's orthogonality / factor-activity / encoder-variance regularizers are added.
+           with OPF (model=lewm_opf): the latent is predicted through the factor heads and synthesized, the per-step
+           error is still measured in latent space (unlike the paper, see the OPF note in the code), and OPF's
+           orthogonality / factor-activity / encoder-variance regularizers are added.
            Logs train scalars every step, or full world-model metrics once per val epoch.
   RETURNS: {"loss", "pred_loss", "sigreg_loss", "action_loss"} -- spt backprops on "loss".
   """
@@ -446,11 +447,41 @@ def lewm_forward(self, batch, stage, cfg, ):
   # (The paper starts from H real frames; we start from one because our planner does.)
   predictions, predicted_factors = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
   full_step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
-  if predicted_factors is None:
-    step_errors = full_step_errors
-  else:
-    target_factors = self.model.analyze_target(embeddings[:, 1:])  # [B, K, num_factors, r]; no EMA / stop-gradient, unlike the paper
-    step_errors = torch.stack([factor_prediction_loss(predicted_factors[:, k], target_factors[:, k]) for k in range(num_preds)])  # L_pred per rollout step, discounted below (the paper: one flat mean)
+  step_errors = full_step_errors  # with AND without OPF the prediction loss is measured in latent space (see the OPF note below)
+  if predicted_factors is not None:
+    target_factors = self.model.analyze_target(embeddings[:, 1:])  # [B, K, num_factors, r]; no EMA / stop-gradient, unlike the paper. Used only by L_fac and the audit below.
+    # ---------------------------------------------------------------------------------------------------------------------
+    # OPF DEVIATION FROM THE PAPER (JEPA-Anything, arXiv:2609.20800, Eq. 6): where the prediction error is measured.
+    #
+    # Paper:  L_pred = || u_hat - P^T z ||^2          error between predicted and target FACTORS (factor space)
+    # Ours:   L_pred = || z_hat - z ||^2              error between synthesized and target LATENT (latent space),
+    #                                                  with z_hat = (P^T)^+ u_hat, the latent the planner also uses.
+    #
+    # Same thing in the ideal case: u_hat - P^T z = P^T (z_hat - z), i.e. the factor error is the latent error seen
+    # through the basis P^T. If P is exactly orthogonal (a pure rotation, the paper's Proposition 1) lengths do not
+    # change and both losses are identical, so in the setting the paper describes nothing changes.
+    #
+    # Why we changed it: P is learnable. With the paper's loss the cheapest way to lower L_pred is not to predict better
+    # but to make P "blind" to latent directions that are hard to predict (a small singular value hides that direction's
+    # error; two factors pointing at the same direction remove it from the loss entirely). Measured on our setup
+    # (2,000 local steps on level 2, 2026-09-26):
+    #     factor-space loss (paper):  min singular value of P 0.029 after 250 steps -> 0.007, condition number 37 -> 148,
+    #                                 overlap between factors 0.29  -> the basis collapses and never recovers
+    #     latent-space loss (ours):   min singular value 0.98, condition number 1.02, overlap 0.016 -> stays orthogonal
+    # A collapsed basis (1) stops training the collapsed latent directions at all (the paper's Corollary 1 warns about
+    # exactly this), (2) amplifies prediction errors by up to 1/sigma_min (~140x) in the synthesis, which our rollout
+    # feeds back as the next input, and (3) makes the factors overlap, so they can no longer be analysed separately.
+    # In latent space the hidden error counts fully again, so the incentive disappears.
+    #
+    # What P still learns: WHICH latent directions are grouped into which factor head (each head has its own capacity);
+    # rotations inside one factor are absorbed by that head's last layer.
+    # Why the paper may not see it (not tested): its targets come from a stop-gradient EMA encoder that is stable from
+    # the start, while ours come from the encoder that is still learning (large early errors); and the authors' code has
+    # an optional "qr_retraction" mode that re-orthogonalizes P after every step, which our port omits.
+    #
+    # The paper's version, to switch back:
+    # step_errors = torch.stack([factor_prediction_loss(predicted_factors[:, k], target_factors[:, k]) for k in range(num_preds)])
+    # ---------------------------------------------------------------------------------------------------------------------
   weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
   prediction_loss = (weights / weights.sum() * step_errors).sum()  # normalized, so the loss keeps the scale of a single-step MSE
 

@@ -15,6 +15,10 @@ Changes:
   - omitted: orthogonality_mode ("qr_init", "qr_retraction"), initial_basis, valid_mask, reduction options,
     the streaming variance tracker, decorrelation diagnostics and jepa_anything_objective (lewm_forward
     assembles the terms itself, because our prediction term is discounted over a rollout).
+  - L_pred is NOT used in training: lewm_forward measures the prediction error in latent space instead of factor
+    space, because with a learnable basis the factor-space loss lets the basis collapse (measured: min singular
+    value 0.007, condition number 148). The full reasoning is in the "OPF DEVIATION" note in training/lewm.py.
+    factor_prediction_loss is kept below for reference and for switching back.
 FactorHeads is ours: the release defines no predictor module.
 """
 
@@ -140,6 +144,7 @@ def _coordinate_variance(samples):
 def factor_prediction_loss(predicted_factors, target_factors):
   """
   L_pred: directly regress factor direction and magnitude.
+  Not used in our training (see the module docstring): we measure the error in latent space instead.
 
   GETS:    predicted_factors, target_factors -- [..., K, r], same shape.
   DOES:    mean squared error over every sample, factor and coordinate.
