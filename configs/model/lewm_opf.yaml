@@ -1,7 +1,11 @@
 # LeWM + Orthogonal Predictive Factorization (JEPA-Anything, arXiv:2609.20800). Select with: model=lewm_opf
 # Everything is taken from lewm.yaml; only pred_proj is replaced by one head per factor + pseudoinverse synthesis.
-# Controls:  model.opf.learnable=false            fixed identity P (factor k = latent coordinates [k*r, (k+1)*r))
-#            loss.opf.orthogonality_weight=0      learnable P without the orthogonality constraint (unconstrained heads)
+# Default: the authors' qr_retraction mode (P exactly orthogonal after every step) + the paper's factor-space loss.
+# Variants (see the OPF note in training/lewm.py):
+#   model.opf.orthogonality_mode=soft_gram                                                  soft penalty only: P collapsed in our test
+#   model.opf.orthogonality_mode=soft_gram loss.opf.prediction_space=latent                 soft penalty + latent loss (commit 5a1b04e)
+#   model.opf.orthogonality_mode=soft_gram loss.opf.orthogonality_weight=0                  no orthogonality at all (the paper's unconstrained baseline)
+#   model.opf.learnable=false model.opf.orthogonality_mode=soft_gram                        fixed identity P (factor k = latent coordinates [k*r, (k+1)*r))
 defaults:
   - lewm
   - _self_
@@ -13,6 +17,8 @@ opf:
   state_dim: ${embed_dim}
   num_factors: 4  # K; the latent stays 192-dim, cut into 4 factors of r = 192 / 4 = 48 coordinates
   learnable: true  # the class default is false (fixed basis), as in the original
+  orthogonality_mode: qr_retraction  # the class default is soft_gram, as in the original; qr_retraction needs learnable: true
+  qr_retraction_frequency: 1  # retract after every optimizer step
 
 factor_heads:
   _target_: master_thesis.models.lewm.FactorHeads

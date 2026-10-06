@@ -84,6 +84,24 @@ class SaveCheckpointEvery(Callback):
       torch.save(self.model.state_dict(), self.folder / f"weights_step{step}.pt")  # loadable like weights.pt
 
 
+class OrthogonalRetraction(Callback):
+  """
+  JEPA-Anything's qr_retraction mode: keep the OPF basis exactly orthogonal during training.
+
+  GETS:    opf -- the model's OrthogonalFactorProjection (orthogonality_mode="qr_retraction").
+  DOES:    after every training batch, i.e. right after stable-pretraining's optimizer step inside training_step,
+           calls opf.after_optimizer_step(global_step), which re-orthonormalizes the basis every
+           qr_retraction_frequency steps. Registered first in main(), so checkpoints and planning see the retracted basis.
+  """
+
+  def __init__(self, opf):
+    self.opf = opf
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if trainer.global_step > 0:  # global_step = optimizer steps done so far (one per batch)
+      self.opf.after_optimizer_step(trainer.global_step)
+
+
 class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image for the ViT
   """
   Convert an ARC-AGI-3 categorical 64x64 grid into RGB pixels for
@@ -422,8 +440,8 @@ def lewm_forward(self, batch, stage, cfg, ):
   DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
            JEPA.predict_rollout -> predicted next latents;
            with OPF (model=lewm_opf): the latent is predicted through the factor heads and synthesized, the per-step
-           error is still measured in latent space (unlike the paper, see the OPF note in the code), and OPF's
-           orthogonality / factor-activity / encoder-variance regularizers are added.
+           error is measured between predicted and target factors (the paper's L_pred; loss.opf.prediction_space,
+           see the OPF note in the code), and OPF's orthogonality / factor-activity / encoder-variance regularizers are added.
            Logs train scalars every step, or full world-model metrics once per val epoch.
   RETURNS: {"loss", "pred_loss", "sigreg_loss", "action_loss"} -- spt backprops on "loss".
   """
@@ -447,41 +465,43 @@ def lewm_forward(self, batch, stage, cfg, ):
   # (The paper starts from H real frames; we start from one because our planner does.)
   predictions, predicted_factors = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
   full_step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
-  step_errors = full_step_errors  # with AND without OPF the prediction loss is measured in latent space (see the OPF note below)
-  if predicted_factors is not None:
-    target_factors = self.model.analyze_target(embeddings[:, 1:])  # [B, K, num_factors, r]; no EMA / stop-gradient, unlike the paper. Used only by L_fac and the audit below.
+  step_errors = full_step_errors  # without OPF (and in the OPF "latent" ablation) the prediction loss is measured in latent space
+  if self.model.opf is not None:
+    target_factors = self.model.analyze_target(embeddings[:, 1:])  # [B, K, num_factors, r]; no EMA / stop-gradient, unlike the paper. Also used by L_fac and the audit below.
     # ---------------------------------------------------------------------------------------------------------------------
-    # OPF DEVIATION FROM THE PAPER (JEPA-Anything, arXiv:2609.20800, Eq. 6): where the prediction error is measured.
+    # OPF: WHERE THE PREDICTION ERROR IS MEASURED (loss.opf.prediction_space) AND WHY P IS RETRACTED
     #
-    # Paper:  L_pred = || u_hat - P^T z ||^2          error between predicted and target FACTORS (factor space)
-    # Ours:   L_pred = || z_hat - z ||^2              error between synthesized and target LATENT (latent space),
-    #                                                  with z_hat = (P^T)^+ u_hat, the latent the planner also uses.
+    #   "factor" (default, the paper's Eq. 6):  L_pred = || u_hat - P^T z ||^2   predicted vs target FACTORS
+    #   "latent" (ablation, commit 5a1b04e):    L_pred = || z_hat - z ||^2       synthesized vs target LATENT,
+    #                                                                             z_hat = (P^T)^+ u_hat (what the planner uses)
+    # Both are the same number whenever P is exactly orthogonal: u_hat - P^T z = P^T (z_hat - z), and a rotation keeps
+    # lengths (the paper's Proposition 1).
     #
-    # Same thing in the ideal case: u_hat - P^T z = P^T (z_hat - z), i.e. the factor error is the latent error seen
-    # through the basis P^T. If P is exactly orthogonal (a pure rotation, the paper's Proposition 1) lengths do not
-    # change and both losses are identical, so in the setting the paper describes nothing changes.
+    # With orthogonality_mode="soft_gram" (only the Gram penalty keeps P orthogonal), the factor loss can be lowered by
+    # making P "blind" to latent directions that are hard to predict: a small singular value hides that direction's
+    # error, two factors pointing the same way remove it entirely. Measured on our setup (2,000 local steps on level 2,
+    # 2026-09-26):
+    #     soft_gram + factor loss:  min singular value of P 0.029 after 250 steps -> 0.007, condition number 37 -> 148,
+    #                               overlap between factors 0.29 -> the basis collapses and never recovers
+    #     soft_gram + latent loss:  min singular value 0.98, condition number 1.02, overlap 0.016
+    # A collapsed basis stops training the collapsed directions (the paper's Corollary 1), amplifies prediction errors
+    # by up to 1/sigma_min (~140x) in the synthesis that our rollout feeds back, and makes the factors overlap.
+    # The collapsed numbers match the paper's own *unconstrained* multi-head baseline on CITRIS (sigma_min 0.005,
+    # condition 438). The orthogonal geometry the paper reports (overlap ~1e-16) comes from its strict QR decomposition
+    # ("The controlled geometry analysis uses this strict decomposition"), and the release contains no training code.
     #
-    # Why we changed it: P is learnable. With the paper's loss the cheapest way to lower L_pred is not to predict better
-    # but to make P "blind" to latent directions that are hard to predict (a small singular value hides that direction's
-    # error; two factors pointing at the same direction remove it from the loss entirely). Measured on our setup
-    # (2,000 local steps on level 2, 2026-09-26):
-    #     factor-space loss (paper):  min singular value of P 0.029 after 250 steps -> 0.007, condition number 37 -> 148,
-    #                                 overlap between factors 0.29  -> the basis collapses and never recovers
-    #     latent-space loss (ours):   min singular value 0.98, condition number 1.02, overlap 0.016 -> stays orthogonal
-    # A collapsed basis (1) stops training the collapsed latent directions at all (the paper's Corollary 1 warns about
-    # exactly this), (2) amplifies prediction errors by up to 1/sigma_min (~140x) in the synthesis, which our rollout
-    # feeds back as the next input, and (3) makes the factors overlap, so they can no longer be analysed separately.
-    # In latent space the hidden error counts fully again, so the incentive disappears.
-    #
-    # What P still learns: WHICH latent directions are grouped into which factor head (each head has its own capacity);
-    # rotations inside one factor are absorbed by that head's last layer.
-    # Why the paper may not see it (not tested): its targets come from a stop-gradient EMA encoder that is stable from
-    # the start, while ours come from the encoder that is still learning (large early errors); and the authors' code has
-    # an optional "qr_retraction" mode that re-orthogonalizes P after every step, which our port omits.
-    #
-    # The paper's version, to switch back:
-    # step_errors = torch.stack([factor_prediction_loss(predicted_factors[:, k], target_factors[:, k]) for k in range(num_preds)])
+    # Default therefore: the authors' orthogonality_mode="qr_retraction". The OrthogonalRetraction callback
+    # re-orthonormalizes P after every optimizer step, so P is exactly orthogonal at every forward pass and the
+    # paper's factor loss is used unchanged. What P learns is then a rotation only: WHICH latent directions are
+    # grouped into which factor head (rotations inside one factor are absorbed by that head's last layer).
+    # The two measured soft_gram runs stay reproducible:
+    #     model.opf.orthogonality_mode=soft_gram                                     -> the collapse (factor loss)
+    #     model.opf.orthogonality_mode=soft_gram loss.opf.prediction_space=latent    -> the variant of commit 5a1b04e
     # ---------------------------------------------------------------------------------------------------------------------
+    if cfg.loss.opf.prediction_space == "factor":
+      step_errors = torch.stack([factor_prediction_loss(predicted_factors[:, k], target_factors[:, k]) for k in range(num_preds)])  # L_pred per rollout step, discounted below (the paper: one flat mean)
+    elif cfg.loss.opf.prediction_space != "latent":
+      raise ValueError(f"loss.opf.prediction_space must be 'factor' or 'latent', got {cfg.loss.opf.prediction_space!r}")
   weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
   prediction_loss = (weights / weights.sum() * step_errors).sum()  # normalized, so the loss keeps the scale of a single-step MSE
 
@@ -597,6 +617,8 @@ def main(cfg: DictConfig) -> None:
   spt.set(cache_dir=str(stablewm_home() / "spt_cache"), requeue_checkpoint=False)
 
   callbacks = []
+  if model.opf is not None and model.opf.orthogonality_mode == "qr_retraction":
+    callbacks.append(OrthogonalRetraction(model.opf))  # first in the list, so checkpoints and planning below see the retracted basis
   every_steps = cfg.get("checkpoint_every_steps")  # e.g. 10000; None/0 = only the final weights
   if every_steps:
     checkpoint_dir = run_dir / "checkpoints"

@@ -77,7 +77,7 @@ class JEPA(nn.Module):
     RETURNS: predicted next-state latents [B, T, 192]. Position t = the prediction of state t+1.
     """
     if self.opf is not None:
-      return self.synthesize_complete_state(self.predict_factors(emb, act_emb))
+      return self.synthesize_complete_state(self.predict_factors(emb, act_emb))  # OPF path: trunk + 4 heads -> factors [B, T, 4, 48] -> synthesis -> latents [B, T, 192]. Same output as the path below.
     preds = self.predictor(emb, act_emb)
     preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))  # pred_proj is an MLP over the feature dim only, so flatten (B,T) to apply it per-token, then restore
     preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
@@ -92,9 +92,9 @@ class JEPA(nn.Module):
     DOES:    runs the ARPredictor (shared trunk), then FactorHeads (one head q_k per factor).
     RETURNS: predicted factors [B, T, num_factors, r]. Position t = the factors of state t+1.
     """
-    hidden = self.predictor(emb, act_emb)
-    factors = self.factor_heads(rearrange(hidden, "b t d -> (b t) d"))
-    return rearrange(factors, "(b t) k r -> b t k r", b=emb.size(0))
+    hidden = self.predictor(emb, act_emb)  # the shared trunk: causal attention over the history + action conditioning -> [B, T, 192]
+    factors = self.factor_heads(rearrange(hidden, "b t d -> (b t) d"))  # the heads' BatchNorm1d needs [N, 192] -> [B*T, 4, 48]
+    return rearrange(factors, "(b t) k r -> b t k r", b=emb.size(0))  # restore batch and time -> [B, T, 4, 48]
 
   def synthesize_complete_state(self, factor_blocks):
     """
