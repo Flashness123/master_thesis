@@ -7,6 +7,7 @@ Acting in the real ARC game with a trained world model, and evaluating it.
   follow_waypoints    completes a level by planning from waypoint to waypoint (frames of a recorded solution)
   evaluate_planning   goal states come from recorded episodes; writes one row per attempt and a GIF
   evaluate_waypoints  tries to complete levels along successful recorded solutions; one row + GIF per attempt
+  next_state_targets  plays every action once from every state of recorded solutions (for next_state_metrics in world_model_metrics.py)
 
 Usage:
   uv run python -m master_thesis.evaluation.arc_policies --lewm-run ls20_goose-ppo-l1_ft130ep_0914-2034 --dataset human_l1-7
@@ -266,6 +267,67 @@ def evaluate_waypoints(model, game: str = "ls20", game_id: str = "ls20-9607627b"
     env.close()
 
   return rows
+
+
+def next_state_targets(game: str = "ls20", game_id: str = "ls20-9607627b", dataset: str = "human_l1-7", levels=None, episodes_per_level: int = 3, goal_ahead: int = 5, seed: int = 0):
+  """
+  The real outcome of every action along successful recorded solutions, for next_state_metrics (evaluation/world_model_metrics.py).
+  Walks along each solution in the real game. In every state it plays each action once on a copy of the game, so all actions start
+  from the same state, then follows the recorded action and checks that this reproduces the recording.
+  Independent of the model, so a training run computes it only once.
+  Returns the frames as numpy arrays; S = states along the solutions, A = actions (4 in ls20):
+    levels    [S]             level of each state
+    states    [S, 4096]       each state
+    outcomes  [S, A, 4096]    the frame the game shows after each action
+    goals     [S, 4096]       the solution's state goal_ahead steps later (the planner's goal)
+  """
+  import copy
+
+  from arcengine import ActionInput
+
+  from master_thesis.environments.arc_ppo import ArcPPOEnv
+  from master_thesis.evaluation.arc_dataset_metric_visualization import load_columns
+
+  grids, actions, episode_levels, successes, episodes = load_columns(game, dataset)
+
+  found = {"levels": [], "states": [], "outcomes": [], "goals": []}  # one array per solution
+  for level in (sorted(set(episode_levels.tolist())) if levels is None else levels):
+    env = ArcPPOEnv(game_id=game_id, seed=seed + level, levels=[level], max_steps=500, stop_on_success=False)
+    used = 0
+
+    for index, (start, length) in enumerate(episodes):
+      steps = length - 1 - goal_ahead  # states whose goal still lies inside the solution
+      if used == episodes_per_level:
+        break
+      if episode_levels[start] != level or not successes[start] or steps < 1:
+        continue
+
+      solution = grids[start:start + length]  # the recorded run; its last frame completes the level
+      env.reset(options={"start_level": level})
+      if not np.array_equal(env.grid.reshape(-1), solution[0]):  # starts mid-level (e.g. a Goose run branching off a solution): cannot be replayed from the level start
+        continue
+
+      after = np.zeros((steps, len(env.actions), solution.shape[1]), dtype=np.uint8)  # [steps, A, 4096]
+      for step in range(steps):
+        for position, action in enumerate(env.actions):  # every action the planner can press
+          game_copy = copy.deepcopy(env.game)  # the game in this state (copying the whole env fails on a thread lock)
+          after[step, position] = np.asarray(game_copy.perform_action(ActionInput(id=action), raw=True).frame[-1]).reshape(-1)  # its last rendered frame = what env.step would show
+        recorded = int(actions[start + step]) - 1  # ARC action id 1..A -> position in env.actions
+        env.step(recorded)  # follow the solution to the next state
+        if not (np.array_equal(after[step, recorded], solution[step + 1]) and np.array_equal(env.grid.reshape(-1), solution[step + 1])):  # the copy and the game both reproduce the recording
+          print(f"next_state_targets: level {level} episode {index} differs from its recording at step {step}; skipped")
+          break
+      else:  # the whole solution was reproduced
+        for key, value in (("levels", np.full(steps, level)), ("states", solution[:steps]), ("outcomes", after), ("goals", solution[goal_ahead:goal_ahead + steps])):
+          found[key].append(value)
+        used += 1
+
+    env.close()
+
+  if not found["states"]:
+    raise ValueError(f"No successful episode in {dataset} could be replayed from its level start")
+
+  return {key: np.concatenate(arrays) for key, arrays in found.items()}  # all solutions after each other
 
 
 def main() -> None:

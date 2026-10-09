@@ -66,7 +66,6 @@ prediction projector
 
 validation only (evaluation/world_model_metrics.py, shuffled validation batches):
   copy_loss / copy_gap        prediction vs. "nothing changes" (z(t+1) = z(t))
-  action_gap                  extra error when only a2 is replaced by another sample's a2
   rollout_loss                ẑ3 from z0 only (own predictions fed back) vs. z3; baseline rollout_copy_loss (z3 = z0)
   batch_latent_std            spread of the embeddings across the batch (≈ 0 = collapse)
 
@@ -168,8 +167,9 @@ uv run python -m master_thesis.evaluation.arc_policies \
   (--weights checkpoints/weights_step30000.pt evaluates an intermediate checkpoint)
   (--tensorboard --step 30000 also writes planning/* into that run's TensorBoard)
 
-During training: planning.every_steps=10000 in the LeWM config (off by default), GIFs land in
-models/lewm/<run>/planning/step<N>/.
+During training: planning.every_steps=10000 in the LeWM config (off by default) logs planning/*, waypoints/*
+and next_state/* (next-state prediction for every action, world_model_metrics.next_state_metrics); GIFs land in
+models/lewm/<run>/planning/step<N>/goals/ and .../waypoints/ and in TensorBoard (tab IMAGES).
 
 4. Train LeWM
 ------------------------------------------------------------------------------
@@ -191,7 +191,7 @@ Useful keys: data.dataset, trainer.max_epochs, loader.batch_size, loader.num_wor
              sampling.success_probability_sampling (share of successful episodes per level), seed
 Show the final config without training: add  --cfg job
 Watch training: uv run tensorboard --logdir "$STABLEWM_HOME/models/lewm"
-Validation metrics (validate/...): pred_loss vs copy_loss, action_gap, rollout_loss vs rollout_copy_loss,
+Validation metrics (validate/...): pred_loss vs copy_loss, rollout_loss vs rollout_copy_loss,
                                    batch_latent_std, sigreg_loss
 
 

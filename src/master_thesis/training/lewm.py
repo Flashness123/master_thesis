@@ -25,18 +25,25 @@ from master_thesis.evaluation.world_model_metrics import world_model_metrics
 
 class PlanningEvaluation(Callback):
   """
-  Every `every_steps` optimizer steps: play in the real ARC game with the current model (see evaluation/arc_policies.py).
-  mode "goals": reach single goal states, logs planning/*; mode "waypoints": complete levels along human solutions, logs waypoints/*.
-  The GIFs go to models/lewm/<run>/planning/step<N>/ and into TensorBoard (tab IMAGES).
+  Every `every_steps` optimizer steps: evaluate the current model in the real ARC game along the human solutions of planning.dataset
+  (evaluation/arc_policies.py, metrics in evaluation/world_model_metrics.py):
+    planning/*    can the planner reach single human states (goal_steps after the level start)?
+    waypoints/*   can it complete levels, planning from waypoint to waypoint (every waypoint_every-th human state)?
+    next_state/*  how well does the model predict the next state of every action (next_state_metrics)? Once for the levels
+                  in the training data (_train_levels) and once for the others (_held_out)
+  The GIFs of planning/* and waypoints/* go to models/lewm/<run>/planning/step<N>/ and into TensorBoard (tab IMAGES).
   """
 
-  def __init__(self, model, folder: Path, every_steps: int, settings: dict):
+  def __init__(self, model, folder: Path, every_steps: int, settings: dict, trained_levels: set):
     self.model = model  # the JEPA (not the spt.Module wrapper)
     self.folder = folder  # models/lewm/<run>/planning: GIFs per evaluation
     self.every_steps = every_steps
-    self.mode = settings.pop("mode", "goals")
-    settings.pop("waypoint_every" if self.mode == "goals" else "goal_steps", None)  # the setting of the other mode is not an argument here
+    self.goal_steps = settings.pop("goal_steps")  # planning/* only
+    self.waypoint_every = settings.pop("waypoint_every")  # waypoints/* only; also how far ahead the goal of next_state/* lies
     self.settings = settings  # dataset, levels, episodes_per_level, samples, ... from the config
+    self.trained_levels = trained_levels  # levels in the training data; next_state/* reports the others as held out
+    self.to_pixels = ArcGridToPixels(224)  # the planner's preprocessing (LewmRolloutPlanner's default img_size)
+    self.next_states = None  # real outcome of every action along the solutions: played at the first evaluation, the same afterwards
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     step = trainer.global_step
@@ -44,24 +51,37 @@ class PlanningEvaluation(Callback):
       return
 
     # imported here so training does not depend on the ARC game
-    from master_thesis.evaluation.arc_policies import evaluate_planning, evaluate_waypoints
-    from master_thesis.evaluation.world_model_metrics import planning_metrics, waypoint_metrics
+    from master_thesis.evaluation.arc_policies import evaluate_planning, evaluate_waypoints, next_state_targets
+    from master_thesis.evaluation.world_model_metrics import next_state_metrics, planning_metrics, waypoint_metrics
 
-    evaluate, summarize = (evaluate_waypoints, waypoint_metrics) if self.mode == "waypoints" else (evaluate_planning, planning_metrics)
     gif_dir = self.folder / f"step{step}"
+    device = pl_module.device
     was_training = self.model.training
     self.model.eval()  # planning must be deterministic (the predictor has dropout)
     try:
-      rows = evaluate(self.model, gif_dir=gif_dir, device=str(pl_module.device), **self.settings)
-      metrics = {name: value for name, value in summarize(rows).items() if value == value}  # drop NaN (e.g. no distance measured)
-      pl_module.log_dict(metrics, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard
+      metrics = planning_metrics(evaluate_planning(self.model, goal_steps=self.goal_steps, gif_dir=gif_dir / "goals", device=str(device), **self.settings))
+      metrics.update(waypoint_metrics(evaluate_waypoints(self.model, waypoint_every=self.waypoint_every, gif_dir=gif_dir / "waypoints", device=str(device), **self.settings)))
+      pl_module.log_dict({name: value for name, value in metrics.items() if value == value}, on_step=True, on_epoch=False, batch_size=1)  # next to train/* and val/* in the same TensorBoard; drop NaN (e.g. no distance measured)
 
       writer = next(logger for logger in trainer.loggers if isinstance(logger, TensorBoardLogger)).experiment  # stable-pretraining adds its own CSV logger next to ours
-      for path in sorted(gif_dir.glob("*.gif")):  # the GIFs just written, as animations in TensorBoard (tab IMAGES shows GIFs as they are)
+      for path in sorted(gif_dir.glob("*/*.gif")):  # the GIFs just written (goals/, waypoints/), as animations in TensorBoard (tab IMAGES shows GIFs as they are)
         width, height = Image.open(path).size
-        tag = path.stem.rsplit("_", 1)[0]  # without the outcome (_completed/_failed), so one episode keeps one slider over all steps
+        tag = f"{path.parent.name}/{path.stem.rsplit('_', 1)[0]}"  # goals/... or waypoints/..., without the outcome (_reached/_completed/...), so one episode keeps one slider over all steps
         image = Summary.Image(height=height, width=width, colorspace=3, encoded_image_string=path.read_bytes())  # the file itself; add_video would need moviepy (breaks on the pygame install)
-        writer._get_file_writer().add_summary(Summary(value=[Summary.Value(tag=f"{self.mode}/{tag}", image=image)]), step)
+        writer._get_file_writer().add_summary(Summary(value=[Summary.Value(tag=tag, image=image)]), step)
+
+      # next_state/*: the goal of each state is the next waypoint, waypoint_every states later
+      if self.next_states is None:  # the real outcomes do not depend on the model, so the game is played only once
+        self.next_states = next_state_targets(dataset=self.settings["dataset"], levels=self.settings["levels"], goal_ahead=self.waypoint_every)
+      held_out = torch.tensor([level not in self.trained_levels for level in self.next_states["levels"].tolist()])
+      with torch.no_grad():
+        encode = lambda grids: torch.cat([self.model.encode({"pixels": self.to_pixels(grids[i:i + 256].to(device))[:, None]})["emb"][:, 0] for i in range(0, len(grids), 256)])  # [frames, 4096] -> [frames, 192], 256 at a time (a multiple of 4, so two blocked moves of one state are encoded together and tie exactly)
+        actions = self.model.action_encoder(torch.eye(self.next_states["outcomes"].shape[1], 9, device=device)[:, None])[:, 0]  # ACTION1..4 as the planner encodes them (one-hot, x = y = 0)  [4, 192]
+        for group, selected in (("train_levels", ~held_out), ("held_out", held_out)):
+          if selected.any():
+            states, outcomes, goals = (torch.as_tensor(self.next_states[key])[selected] for key in ("states", "outcomes", "goals"))
+            group_metrics = next_state_metrics(self.model, encode(states), actions, encode(outcomes.flatten(0, 1)).unflatten(0, outcomes.shape[:2]), encode(goals))
+            pl_module.log_dict({f"next_state/{name}_{group}": value for name, value in group_metrics.items() if value == value}, on_step=True, on_epoch=False, batch_size=1)  # drop NaN (spearman of a group without any order)
     except Exception as error:  # a failing evaluation must not end a long training run
       print(f"Planning evaluation at step {step} failed: {error!r}")
     finally:
@@ -189,27 +209,30 @@ class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (7-way one-hot + norm
 
     return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )  # --- assemble the 9-D vector: [7 one-hot | x/63 | y/63] ---
 
-def build_dataset(cfg: DictConfig):  # opens the Lance data as 4-state windows and attaches the transforms
+def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length windows and attaches the transforms
   """
   Open one Lance dataset as overlapping fixed-length windows and wire the transforms onto it.
 
   GETS:    cfg -- the resolved Hydra config. Uses cfg.data.* (which Lance table, frameskip,
-           which columns), 1 + cfg.wm.num_preds (window length), cfg.img_size.
+           which columns), the window length (from extensions.rollout_loss and cfg.wm), cfg.img_size.
   DOES:    load_dataset gives a windowed view of the table; then attach ArcGridToPixels and
            ArcActionEncoding as the per-sample transform; then record the action dim back into cfg.
   RETURNS: a stable-worldmodel dataset whose __getitem__ yields one window as
            {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
            {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
-           (T = 1 + num_preds = 6: one real frame + K imagined steps.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
+           (T = 4 for LeWM's one-step loss, 6 with the rollout loss.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
   """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
     raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
 
+  # Frames per sample. LeWM's one-step loss: history_size + 1 = 4 (3 context frames + 1 more target).
+  # Rollout loss (Semigroup-JEPA): 1 + num_preds = 6 (one real frame + K imagined steps); with both on, the one-step loss uses the first 4.
+  window = 1 + cfg.wm.num_preds if cfg.extensions.rollout_loss else cfg.wm.history_size + 1
   dataset_name = cfg.data.name
   dataset = swm.data.load_dataset(dataset_name, transform=None,  # The windowing call (stable-worldmodel, not our code). num_steps=4 means every sample is 4 consecutive states of ONE episode; consecutive windows overlap (slide by 1). This is why a 41-state episode yields 38 windows. frameskip=1 -> no frames skipped (one ARC step = one transition).
-                                  frameskip=cfg.data.frameskip, 
-                                  num_steps=(1 + cfg.wm.num_preds),  # was history_size + num_preds (= 4) for the one-step loss; the rollout loss needs 1 real frame + K targets 
-                                  keys_to_load=list(cfg.data.keys_to_load), ) 
+                                  frameskip=cfg.data.frameskip,
+                                  num_steps=window,
+                                  keys_to_load=list(cfg.data.keys_to_load), )
 
   grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))  # [4096]->[3,224,224]
   action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))  # [3]->[9]
@@ -409,79 +432,93 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
 
 def lewm_forward(self, batch, stage, cfg, ):
   """
-  The LeWM training/validation step: encode 1 + K states, imagine K steps from the first one, score them.
+  The training/validation step: LeWM, plus the additions from later papers switched on in cfg.extensions.
 
   GETS:    self  -- the stable-pretraining Module wrapper. Holds self.model (the JEPA),
                     self.sigreg (the SIGReg regularizer), and self.training (train vs eval flag).
            batch -- one DataLoader batch, already transformed:
-                    {"pixels":[B,K+1,3,224,224], "action":[B,K+1,9], "grid":[B,K+1,4096]}.
-                    K = wm.num_preds (5); action a_t is the action taken IN state s_t.
+                    {"pixels":[B,T,3,224,224], "action":[B,T,9], "grid":[B,T,4096]}; T = 4 for LeWM,
+                    1 + wm.num_preds with the rollout loss. Action a_t is the action taken IN state s_t.
            stage -- "fit"/"validate" (unused here, branch on self.training instead).
-           cfg   -- resolved config; uses wm.history_size, wm.num_preds, loss.sigreg.*.
-  DOES:    JEPA.encode -> per-frame latents + action latents; slice into (context, targets);
-           JEPA.predict -> predicted next latents;
-           Logs train scalars every step, or full world-model metrics once per val epoch.
-  RETURNS: {"loss", "pred_loss", "sigreg_loss"} -- spt backprops on "loss".
+           cfg   -- resolved config; uses extensions.*, wm.history_size, loss.*.
+  DOES:    JEPA.encode -> per-frame latents + action latents, then the loss terms:
+             prediction -- LeWM's one-step teacher-forced MSE (extensions.one_step_loss) and/or Semigroup-JEPA's rollout loss (extensions.rollout_loss)
+             SIGReg     -- on the latents, or TC-SIGReg on their window-centred version (extensions.tc_sigreg)
+             action     -- Delta-JEPA's action decoder (extensions.delta_jepa)
+           Logs every term each training step, and world-model metrics once per val epoch.
+  RETURNS: {"loss", one entry per term} -- spt backprops on "loss".
   """
+  extensions = cfg.extensions
   history_size = cfg.wm.history_size
-  num_preds = cfg.wm.num_preds  # K: steps imagined per window; the window is 1 real frame + K frames
 
   # ViT treats all frames as independent images - the encoder never sees context, the predictor does
   output = self.model.encode(batch)  # JEPA.encode flattens [B,T,...] -> [B*T,...], runs the ViT + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
-  embeddings = output["emb"]  # z0..zK   [B, K+1, 192]
-  action_embeddings = output["act_emb"]  # e(a0)..e(aK)  [B, K+1, 192]
+  embeddings = output["emb"]  # z0..z(T-1)   [B, T, 192]
+  action_embeddings = output["act_emb"]  # e(a0)..e(a(T-1))  [B, T, 192]
+  terms = {}  # every loss term: logged name -> (weight in the total loss, value)
 
-  # Old one-step teacher-forced loss (LeWM), replaced by the rollout loss below:
-  # context_embeddings = embeddings[:, :history_size, ]
-  # context_actions = action_embeddings[:, :history_size, ]
-  # targets = embeddings[:, num_preds:, ]
-  # predictions = self.model.predict(context_embeddings, context_actions)
-  # prediction_loss = (predictions - targets).pow(2).mean()
+  # --- prediction: one-step, rollout, or both ---
+  if extensions.one_step_loss:
+    # LeWM: one-step teacher-forced prediction on the window's first history_size + 1 frames. The predictor sees the real z0..z2 (and the actions taken in them)
+    # and predicts z1..z3, every position one step ahead. Targets NOT detached: the encoder is trained from both sides, SIGReg alone prevents collapse.
+    predictions = self.model.predict(embeddings[:, :history_size], action_embeddings[:, :history_size])  # ẑ1..ẑ3  [B, 3, 192]
+    terms["pred_loss"] = (cfg.loss.one_step.weight, (predictions - embeddings[:, 1:history_size + 1]).pow(2).mean())
+  if extensions.rollout_loss:
+    # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from the ONE real z0, feeding predictions back,
+    # exactly as the planner does; the error at every step flows back into predictor AND encoder, so the encoder has to keep what the predictor needs to carry forward.
+    # (The paper starts from H real frames; we start from one because our planner does.)
+    num_preds = embeddings.size(1) - 1  # K = wm.num_preds: the window is 1 real frame + K frames
+    predictions = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
+    step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
+    weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
+    terms["rollout_pred_loss"] = (cfg.loss.rollout.weight, (weights / weights.sum() * step_errors).sum())  # normalized, so the loss keeps the scale of a single-step MSE
 
-  # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from the ONE real z0, feeding predictions back,
-  # exactly as the planner does; the error at every step flows back into predictor AND encoder, so the encoder has to keep what the predictor needs to carry forward.
-  # (The paper starts from H real frames; we start from one because our planner does.)
-  predictions = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
-  step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
-  weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
-  prediction_loss = (weights / weights.sum() * step_errors).sum()  # normalized, so the loss keeps the scale of a single-step MSE
+  # --- SIGReg: anti-collapse ---
+  sigreg_input = embeddings  # [B, T, D]; LeWM: SIGReg on the embeddings themselves
+  if extensions.tc_sigreg:
+    # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames) instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
+    sigreg_input = embeddings - embeddings.mean(dim=1, keepdim=True)
+  terms["sigreg_loss"] = (cfg.loss.sigreg.weight, self.sigreg(sigreg_input.transpose(0, 1)))  # [B, T, D] -> [T, B, D]
 
-  # Delta-JEPA (Zhang et al. 2026, arXiv:2606.31232): a decoder has to name the action from the latent difference alone,
-  # which punishes actions that look alike in latent space - exactly the weakness we measured (tiny action_gap).
-  action_logits = self.model.decode_action(embeddings[:, :-1], embeddings[:, 1:])  # [B, K, 7]: one guess per real transition z_t -> z_t+1 in the window
-  one_hot = batch["action"][:, :-1, :7]  # the 7-way one-hot part of the 9-D action vector; a_t is the action taken IN state s_t, so it matches transition t
-  action_targets = one_hot.argmax(dim=-1).masked_fill(one_hot.sum(dim=-1) == 0, -1)  # class 0..6; an all-zero one-hot is the synthetic end-of-episode action -> -1 = ignored
+  # --- action loss ---
+  if extensions.delta_jepa:
+    # Delta-JEPA (Zhang et al. 2026, arXiv:2606.31232): a decoder has to name the action from the latent difference alone,
+    # which punishes actions that look alike in latent space - exactly the weakness we measured (tiny action_gap, now next_state/action_spread_*).
+    action_logits = self.model.decode_action(embeddings[:, :-1], embeddings[:, 1:])  # [B, T-1, 7]: one guess per real transition z_t -> z_t+1 in the window
+    one_hot = batch["action"][:, :-1, :7]  # the 7-way one-hot part of the 9-D action vector; a_t is the action taken IN state s_t, so it matches transition t
+    action_targets = one_hot.argmax(dim=-1).masked_fill(one_hot.sum(dim=-1) == 0, -1)  # class 0..6; an all-zero one-hot is the synthetic end-of-episode action -> -1 = ignored
+    changed_cells = (batch["grid"][:, 1:] != batch["grid"][:, :-1]).sum(dim=-1)  # [B, T-1]: how much of the screen each transition changed
+    action_targets = action_targets.masked_fill(changed_cells <= cfg.loss.action.min_changed_cells, -1)  # blocked moves look identical whichever direction was pressed, so asking for the action there only teaches noise
+    action_loss = F.cross_entropy(action_logits.flatten(0, 1), action_targets.flatten(), ignore_index=-1) if (action_targets >= 0).any() else action_logits.sum() * 0  # a batch without a single usable transition would give NaN
+    terms["action_loss"] = (cfg.loss.action.weight, action_loss)
 
-  changed_cells = (batch["grid"][:, 1:] != batch["grid"][:, :-1]).sum(dim=-1)  # [B, K]: how much of the screen each transition changed
-  action_targets = action_targets.masked_fill(changed_cells <= cfg.loss.action.min_changed_cells, -1)  # blocked moves look identical whichever direction was pressed, so asking for the action there only teaches noise
-  action_loss = F.cross_entropy(action_logits.flatten(0, 1), action_targets.flatten(), ignore_index=-1) if (action_targets >= 0).any() else action_logits.sum() * 0  # a batch without a single usable transition would give NaN
+  loss = sum(weight * value for weight, value in terms.values())
 
-  # TC-SIGReg (Liu et al. 2026, arXiv:2607.26924): regularize what changes within the window (embedding minus its mean over the window's frames) instead of the embedding itself, so the level layout (constant within a window) no longer competes with player motion for SIGReg's unit variance
-  # sigreg_loss = self.sigreg(embeddings.transpose(0, 1))  # raw LeWM: SIGReg on the embeddings themselves
-  sigreg_loss = self.sigreg((embeddings - embeddings.mean(dim=1, keepdim=True)).transpose(0, 1))  # [B, T, D] -> [T, B, D] 
-  loss = (prediction_loss + cfg.loss.sigreg.weight * sigreg_loss + cfg.loss.action.weight * action_loss)
-
-  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(1 + K states)
-    self.log_dict({"train/loss": loss.detach(), "train/rollout_pred_loss": prediction_loss.detach(), "train/sigreg_loss": sigreg_loss.detach(), "train/action_loss": action_loss.detach(), }, on_step=True, on_epoch=False, sync_dist=True, )
+  if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(T states)
+    self.log_dict({"train/loss": loss.detach(), **{f"train/{name}": value.detach() for name, (_, value) in terms.items()}, }, on_step=True, on_epoch=False, sync_dist=True, )
   else:  # validation: one value per epoch
-    # The earlier val/* metrics, computed as before on the first 4 frames of the window, so the curves stay comparable with older runs.
-    # Note: their teacher-forced part (3 REAL frames as history) is a situation this model is no longer trained on.
+    # World-model metrics on the window's first history_size + 1 frames: the same quantities in every configuration, so runs stay comparable.
+    # With the rollout loss, their teacher-forced part (3 REAL frames as history) is a situation the model is not trained on.
     context_embeddings, context_actions = embeddings[:, :history_size], action_embeddings[:, :history_size]
     teacher_forced = self.model.predict(context_embeddings, context_actions)
-    metrics = world_model_metrics(model=self.model, embeddings=embeddings[:, :history_size + 1], context_embeddings=context_embeddings, context_actions=context_actions, targets=embeddings[:, 1:history_size + 1], predictions=teacher_forced, actions=batch["action"][:, :history_size + 1], )
-    metrics["pred_loss"] = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean()  # the old val/pred_loss: one-step teacher-forced MSE
-    stay = (embeddings[:, 1:] - embeddings[:, :1]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays z0"
-    metrics.update({f"rollout_k{k + 1}": step_errors[k] / stay[k] for k in range(num_preds)})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
-    valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
-    action_accuracy = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
-    self.log_dict({"val/loss": loss.detach(), "val/rollout_pred_loss": prediction_loss.detach(), "val/action_loss": action_loss.detach(), "val/action_accuracy": action_accuracy, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
-  return {"loss": loss, "pred_loss": prediction_loss, "sigreg_loss": sigreg_loss, "action_loss": action_loss, }
+    metrics = world_model_metrics(model=self.model, embeddings=embeddings[:, :history_size + 1], context_embeddings=context_embeddings, context_actions=context_actions, targets=embeddings[:, 1:history_size + 1], predictions=teacher_forced, )
+    metrics["pred_loss"] = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean()  # one-step teacher-forced MSE (without the rollout loss this is the training term itself)
+    if extensions.rollout_loss:
+      stay = (embeddings[:, 1:] - embeddings[:, :1]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays z0"
+      metrics.update({f"rollout_k{k + 1}": step_errors[k] / stay[k] for k in range(len(step_errors))})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
+    if extensions.delta_jepa:
+      valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
+      metrics["action_accuracy"] = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
+    self.log_dict({"val/loss": loss.detach(), **{f"val/{name}": value.detach() for name, (_, value) in terms.items()}, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
+  return {"loss": loss, **{name: value for name, (_, value) in terms.items()}}
 
 @hydra.main(version_base=None, config_path="../../../configs", config_name=None)
 def main(cfg: DictConfig) -> None:
   pl.seed_everything(cfg.seed, workers=True, )
   if "run_name" not in cfg:
     raise ValueError("No training experiment selected. Use --config-name train/arc_lewm.")
+  if not (cfg.extensions.one_step_loss or cfg.extensions.rollout_loss):
+    raise ValueError("Switch on extensions.one_step_loss and/or extensions.rollout_loss: without a prediction loss the predictor is not trained")
 
   dataset = build_dataset(cfg)
 
@@ -492,6 +529,9 @@ def main(cfg: DictConfig) -> None:
 
   train_loader, val_loader, test_loader = build_dataloaders(dataset, cfg)
 
+  if not cfg.extensions.delta_jepa:  # the action decoder only exists for Delta-JEPA; dropping it keeps model_config.json (used by planning and PPO) true to the trained model
+    with open_dict(cfg):
+      cfg.model.pop("action_decoder", None)
   model = hydra.utils.instantiate(cfg.model, )
 
   init_weights = cfg.get("init_weights")
@@ -552,7 +592,8 @@ def main(cfg: DictConfig) -> None:
   planning_cfg = cfg.get("planning")  # optional: plan in the real ARC game during training
   if planning_cfg and planning_cfg.get("every_steps"):
     settings = {key: value for key, value in OmegaConf.to_container(planning_cfg, resolve=True).items() if key != "every_steps"}  # dataset, goal_steps, episodes_per_level, ...
-    callbacks.append(PlanningEvaluation(model, run_dir / "planning", planning_cfg.every_steps, settings))
+    trained_levels = set(torch.as_tensor(dataset.get_col_data("start_level")).reshape(-1).long().unique().tolist())  # every level in the training data; next_state/* reports the others as held out
+    callbacks.append(PlanningEvaluation(model, run_dir / "planning", planning_cfg.every_steps, settings, trained_levels))
 
   trainer = pl.Trainer(**cfg.trainer, default_root_dir=run_dir, logger=logger, callbacks=callbacks, )
   trainer.callbacks = [callback for callback in trainer.callbacks if type(callback).__name__ != "HardwareMonitor"]  # drop stable-pretraining's hardware/* curves (CPU, RAM, disk, network)

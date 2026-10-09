@@ -15,12 +15,11 @@ hydra:
 seed: 3072
 checkpoint_every_steps: 10000  # save checkpoints/step<N>.ckpt (full state) + weights_step<N>.pt; null = only the final weights
 
-planning:  # plan in the real ARC game during training (evaluation/arc_policies.py); every_steps: null = off
+planning:  # evaluate in the real ARC game during training along human solutions (PlanningEvaluation in training/lewm.py): planning/*, waypoints/*, next_state/*; every_steps: null = off
   every_steps: null
-  mode: goals  # goals: reach single goal states (planning/*); waypoints: complete levels along human solutions (waypoints/*)
   dataset: human_l1-7  # goal states / solutions come from these recorded episodes
-  goal_steps: [5, 10, 25]  # goals mode: how many steps after an episode start the goal lies
-  waypoint_every: 5  # waypoints mode: every how many frames of the human solution a waypoint is placed
+  goal_steps: [5, 10, 25]  # planning/*: how many steps after an episode start the goal lies
+  waypoint_every: 5  # waypoints/*: every how many frames of the human solution a waypoint is placed; next_state/*: how far ahead the goal lies
   levels: null  # levels to evaluate (null = all levels in the dataset)
   episodes_per_level: 1
   samples: 200  # action sequences per CEM round
@@ -35,10 +34,15 @@ embed_dim: 192
 sampling:
   success_probability_sampling: 0.2
 
+extensions:  # defaults = plain LeWM (one_step_loss only); switch on the additions from later papers (their settings are under loss.*)
+  one_step_loss: true  # LeWM's own teacher-forced one-step prediction loss; can run alone, with rollout_loss, or be replaced by it (at least one of the two)
+  rollout_loss: false  # Semigroup-JEPA (arXiv:2609.10464): imagine wm.num_preds steps from one real frame (false in all runs up to ls20_multi-no-l3_delta_warm300k; later runs used it instead of one_step_loss)
+  tc_sigreg: false  # TC-SIGReg (arXiv:2607.26924): SIGReg on the latents minus their window mean instead of the latents (false in all runs up to ls20_multi-no-l3_220k_succ0.1_0918-1951)
+  delta_jepa: false  # Delta-JEPA (arXiv:2606.31232): an action decoder names the action from z_t+1 - z_t (adds model.action_decoder and loss.action)
+
 wm:
-  history_size: 3
-  # num_preds: 1  # one-step teacher-forced loss (all runs up to ls20_multi-no-l3_delta_warm300k), windows of history_size + 1 = 4 frames
-  num_preds: 5  # K: steps imagined from one real frame in the rollout loss; windows are 1 + K = 6 frames
+  history_size: 3  # latents the predictor attends to; LeWM's one-step loss uses windows of history_size + 1 = 4 frames
+  num_preds: 5  # K, only with extensions.rollout_loss: steps imagined from one real frame; windows of 1 + K = 6 frames
 
 trainer:
   max_epochs: 100
@@ -71,10 +75,13 @@ optimizer:
 
 
 loss:
-  rollout:
+  one_step:  # extensions.one_step_loss
+    weight: 1.0
+  rollout:  # extensions.rollout_loss
+    weight: 1.0
     discount: 0.95  # gamma: step k of the rollout loss is weighted by gamma^(k-1) (Semigroup-JEPA's best value)
-  action:
-    weight: 0.5  # lambda of Delta-JEPA's action loss; 0 = plain LeWM. Chosen so the action term (~0.5 * 0.6 at convergence) is the same order as the SIGReg term (0.09 * ~1.7);
+  action:  # extensions.delta_jepa
+    weight: 0.5  # lambda of Delta-JEPA's action loss. Chosen so the action term (~0.5 * 0.6 at convergence) is the same order as the SIGReg term (0.09 * ~1.7);
                 # the paper's 10-50 is for an MSE on continuous actions, ours is a cross-entropy that starts near ln 7 = 1.95
     min_changed_cells: 10  # skip transitions that changed at most this many cells: in ls20 those are blocked moves where only the step counter advanced,
                            # so left and right give the SAME next grid and no decoder can tell them apart (35% of transitions; ceiling 0.76 if kept). 0 = use every transition

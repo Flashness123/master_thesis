@@ -4,6 +4,7 @@ Storage layout below $STABLEWM_HOME (the only place that knows it).
 $STABLEWM_HOME/
 ├── arc_environments/                   ARC game files (managed by arc_agi)
 ├── recordings/<game>/<collection>/     raw JSONL episodes + collection.json
+├── synthetic_data/<game>/<collection>/ the same for the synthetic levels (arc_levelgen): solutions + Goose branches
 ├── datasets/<game>/<dataset>.lance     converted Lance datasets (+ <dataset>.json provenance)
 ├── evaluation/<game>/                  evaluation outputs, file names start with the dataset/model name
 └── models/<kind>/<run>/                everything of one trained model; kind = "lewm" or "ppo"
@@ -45,6 +46,11 @@ def arc_environments_dir() -> Path:
 def recordings_dir(game_id: str) -> Path:
   """Folder holding all recording collections of one game."""
   return stablewm_home() / "recordings" / game_folder(game_id)  # e.g. recordings/ls20
+
+
+def synthetic_dir(game_id: str) -> Path:
+  """Folder holding the recording collections of a game's synthetic levels (made by arc_levelgen)."""
+  return stablewm_home() / "synthetic_data" / game_folder(game_id)  # e.g. synthetic_data/ls20
 
 
 def dataset_path(game_id: str, name: str) -> Path:
