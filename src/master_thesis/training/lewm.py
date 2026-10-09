@@ -16,6 +16,7 @@ from functools import partial
 from pathlib import Path
 from PIL import Image
 from tensorboard.compat.proto.summary_pb2 import Summary
+from master_thesis.models.grid_lewm import GridLeWM
 from master_thesis.models.lewm import SIGReg
 from master_thesis.paths import model_dir, stablewm_home, timestamp
 from lightning.pytorch.callbacks import Callback
@@ -42,7 +43,7 @@ class PlanningEvaluation(Callback):
     self.waypoint_every = settings.pop("waypoint_every")  # waypoints/* only; also how far ahead the goal of next_state/* lies
     self.settings = settings  # dataset, levels, episodes_per_level, samples, ... from the config
     self.trained_levels = trained_levels  # levels in the training data; next_state/* reports the others as held out
-    self.to_pixels = ArcGridToPixels(224)  # the planner's preprocessing (LewmRolloutPlanner's default img_size)
+    self.to_pixels = ArcGridToCells() if isinstance(model, GridLeWM) else ArcGridToPixels(224)  # the planner's preprocessing (LewmRolloutPlanner's default img_size)
     self.next_states = None  # real outcome of every action along the solutions: played at the first evaluation, the same afterwards
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -168,6 +169,23 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
 
     return (pixels - mean) / std  # normalized [T, 3, 224, 224]
 
+class ArcGridToCells:  # Grid-LeWM: flattened colour grid → colour IDs for the GridEncoder (no RGB, no resizing)
+  """
+  The observation for Grid-LeWM (models/grid_lewm.py), which embeds every cell's colour itself.
+
+  GETS:    grids [T, 4096] float32, straight from the Lance `grid` column (colour INDEX 0..15 stored as float).
+  DOES:    check the range and turn the values into integer IDs; nothing else (no palette, no resizing).
+  RETURNS: [T, 4096] int64, the GridEncoder's input (its nn.Embedding looks up one vector per colour ID).
+  """
+
+  def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:
+    if grids.shape[-1] != 64 * 64:
+      raise ValueError(f"Expected flattened ARC grids with 4096 values, got shape {tuple(grids.shape)}")
+    grids = grids.long()
+    if torch.any((grids < 0) | (grids > 15)):
+      raise ValueError("ARC grid contains values outside 0..15")
+    return grids
+
 class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (7-way one-hot + normalized x + normalized y)
   """
   Turn one episode's raw actions into the fixed-width vector the action encoder expects.
@@ -215,11 +233,11 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length wind
 
   GETS:    cfg -- the resolved Hydra config. Uses cfg.data.* (which Lance table, frameskip,
            which columns), the window length (from extensions.rollout_loss and cfg.wm), cfg.img_size.
-  DOES:    load_dataset gives a windowed view of the table; then attach ArcGridToPixels and
-           ArcActionEncoding as the per-sample transform; then record the action dim back into cfg.
+  DOES:    load_dataset gives a windowed view of the table; then attach ArcGridToPixels (LeWM) or ArcGridToCells
+           (Grid-LeWM) and ArcActionEncoding as the per-sample transform; then record the action dim back into cfg.
   RETURNS: a stable-worldmodel dataset whose __getitem__ yields one window as
            {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
-           {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
+           {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them ("pixels":[T,4096] colour IDs for Grid-LeWM).
            (T = 4 for LeWM's one-step loss, 6 with the rollout loss.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
   """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
@@ -234,7 +252,8 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length wind
                                   num_steps=window,
                                   keys_to_load=list(cfg.data.keys_to_load), )
 
-  grid_transform = (dt.transforms.WrapTorchTransform(ArcGridToPixels(cfg.img_size), source="grid", target="pixels", ))  # [4096]->[3,224,224]
+  observation = ArcGridToCells() if cfg.model._target_.endswith("GridLeWM") else ArcGridToPixels(cfg.img_size)  # Grid-LeWM embeds the colour IDs itself; LeWM's ViT needs an RGB image
+  grid_transform = (dt.transforms.WrapTorchTransform(observation, source="grid", target="pixels", ))  # [4096]->[3,224,224] (LeWM) or [4096] colour IDs (Grid-LeWM)
   action_transform = (dt.transforms.WrapTorchTransform(ArcActionEncoding(), source="action", target="action", ))  # [3]->[9]
   dataset.transform = (dt.transforms.Compose(grid_transform, action_transform, ))  # run them in order for every item
   action_input_dim = 9  # 7 action one-hot + x + y
@@ -434,7 +453,7 @@ def lewm_forward(self, batch, stage, cfg, ):
   """
   The training/validation step: LeWM, plus the additions from later papers switched on in cfg.extensions.
 
-  GETS:    self  -- the stable-pretraining Module wrapper. Holds self.model (the JEPA),
+  GETS:    self  -- the stable-pretraining Module wrapper. Holds self.model (the JEPA, or GridLeWM with "pixels":[B,T,4096] colour IDs),
                     self.sigreg (the SIGReg regularizer), and self.training (train vs eval flag).
            batch -- one DataLoader batch, already transformed:
                     {"pixels":[B,T,3,224,224], "action":[B,T,9], "grid":[B,T,4096]}; T = 4 for LeWM,
@@ -452,7 +471,7 @@ def lewm_forward(self, batch, stage, cfg, ):
   history_size = cfg.wm.history_size
 
   # ViT treats all frames as independent images - the encoder never sees context, the predictor does
-  output = self.model.encode(batch)  # JEPA.encode flattens [B,T,...] -> [B*T,...], runs the ViT + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
+  output = self.model.encode(batch)  # JEPA.encode flattens [B,T,...] -> [B*T,...], runs the ViT (GridLeWM: GridEncoder + pooling) + projector, reshapes back. Adds "emb" (state latents) and "act_emb" (action latents) to the dict.
   embeddings = output["emb"]  # z0..z(T-1)   [B, T, 192]
   action_embeddings = output["act_emb"]  # e(a0)..e(a(T-1))  [B, T, 192]
   terms = {}  # every loss term: logged name -> (weight in the total loss, value)

@@ -37,13 +37,14 @@ class LewmRolloutPlanner:
     import gymnasium as gym
     from stable_worldmodel.planning.solver.categorical_cem import CategoricalCEMSolver
 
-    from master_thesis.training.lewm import ArcGridToPixels
+    from master_thesis.models.grid_lewm import GridLeWM
+    from master_thesis.training.lewm import ArcGridToCells, ArcGridToPixels
 
     action_ids = [action.value for action in env.actions]
     assert action_ids == list(range(1, len(action_ids) + 1)), "the padding below assumes the actions ACTION1..n without gaps"
 
     self.device = device
-    self.to_pixels = ArcGridToPixels(img_size)  # same preprocessing as in training
+    self.to_pixels = ArcGridToCells() if isinstance(model, GridLeWM) else ArcGridToPixels(img_size)  # same preprocessing as in training (Grid-LeWM: colour IDs)
     self.goal_grid = np.asarray(goal_grid).reshape(-1)
     self.goal_pixels = self._pixels(self.goal_grid)
     self.compare = ~ignore_cells if ignore_cells is not None else np.ones(self.goal_grid.size, dtype=bool)  # cells that decide "goal reached"
@@ -67,7 +68,7 @@ class LewmRolloutPlanner:
     self.solver.configure(action_space=gym.spaces.Discrete(len(action_ids)), n_envs=1, config=SimpleNamespace(horizon=horizon, action_block=1))  # one action per planned step
 
   def _pixels(self, grid):
-    return self.to_pixels(torch.as_tensor(np.asarray(grid).reshape(1, -1), device=self.device))[None]  # [1, 1, 3, img, img] = (batch, time, ...)
+    return self.to_pixels(torch.as_tensor(np.asarray(grid).reshape(1, -1), device=self.device))[None]  # [1, 1, 3, img, img] = (batch, time, ...); Grid-LeWM: [1, 1, 4096]
 
   @torch.no_grad()
   def choose_action(self, grid) -> int:

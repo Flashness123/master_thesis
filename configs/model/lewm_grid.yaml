@@ -1,0 +1,62 @@
+# Grid-LeWM (models/grid_lewm.py): LeWM with a categorical full-resolution Grid Transformer instead of the ViT.
+# Select with model=lewm_grid. Everything below the pool is the same as in lewm.yaml.
+_target_: master_thesis.models.grid_lewm.GridLeWM
+
+encoder:  # 64x64 colour IDs -> 4096 cell tokens [., 4096, 192]
+  _target_: master_thesis.models.grid_lewm.GridEncoder
+  num_colors: 16  # ARC colours 0..15
+  embed_dim: ${embed_dim}
+  depth: 6  # stacked Transformer blocks (ViT-tiny and Grid-JEPA: 12); compute grows linearly with it
+  num_heads: 3  # 192 / 3 = 64 dimensions per head, as in ViT-tiny
+  mlp_ratio: 4.0  # MLP width 4 * 192 = 768
+  max_grid_size: 64  # one learned position vector per cell of the 64x64 grid
+
+pool:  # 4096 cell tokens -> one vector [., 192] (a learned query attends over all cells)
+  _target_: master_thesis.models.grid_lewm.AttentionPooling
+  embed_dim: ${embed_dim}
+  num_heads: 3
+
+
+predictor:
+  _target_: master_thesis.models.lewm.ARPredictor
+  num_frames: ${wm.history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+
+action_encoder:
+  _target_: master_thesis.models.lewm.Embedder
+  input_dim: ???  # Filled automatically from the dataset/action configuration.
+  emb_dim: ${embed_dim}
+
+action_decoder:  # Delta-JEPA (arXiv:2606.31232): recovers the executed action from the latent difference z_t+1 - z_t; built only with extensions.delta_jepa (training/lewm.py drops it otherwise)
+  _target_: master_thesis.models.lewm.MLP
+  input_dim: ${embed_dim}
+  hidden_dim: 512
+  output_dim: 7  # ACTION1..ACTION7 (the 7-way one-hot part of the 9-D action vector)
+
+projector:
+  _target_: master_thesis.models.lewm.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+
+pred_proj:
+  _target_: master_thesis.models.lewm.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

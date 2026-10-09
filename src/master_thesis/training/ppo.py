@@ -18,7 +18,8 @@ from stable_baselines3.common.utils import set_random_seed
 from master_thesis.environments.arc_ppo import ArcPPOEnv
 from master_thesis.paths import model_dir, timestamp
 from master_thesis.evaluation.arc_policy import LevelEvaluation
-from master_thesis.training.lewm import ArcGridToPixels
+from master_thesis.models.grid_lewm import GridLeWM
+from master_thesis.training.lewm import ArcGridToCells, ArcGridToPixels
 
 
 class ArcPolicyInput(gym.Wrapper):
@@ -33,7 +34,7 @@ class ArcPolicyInput(gym.Wrapper):
     self.history = history
     self.frames = deque(maxlen=history)
     self.lewm = lewm
-    self.preprocess = ArcGridToPixels(img_size)
+    self.preprocess = ArcGridToCells() if isinstance(lewm, GridLeWM) else ArcGridToPixels(img_size)  # Grid-LeWM embeds the colour IDs itself
 
     if lewm is None:
       self.palette = (self.preprocess.palette.mul(255).round().byte().numpy())
