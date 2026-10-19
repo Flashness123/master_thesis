@@ -313,24 +313,35 @@ def write_game_version(version, specs, source_game=SOURCE_GAME):
 ###################
 
 
-def certify(game_id, level_number, actions):
+def make_game(game_id):
+  """
+  A local game to play many levels in, made once and reused.
+
+  GETS:    game_id -- e.g. "ls20-syn30" (a version made by write_game_version) or SOURCE_GAME.
+  DOES:    making a game copies every level of its game file, which takes seconds for a file with 1000 levels, so
+           callers make it once and start every level with reset_at_level, which restores all levels as in a new game.
+  RETURNS: the arc_agi LocalEnvironmentWrapper.
+  """
+  import arc_agi
+  from arc_agi import OperationMode
+
+  return arc_agi.Arcade(operation_mode=OperationMode.OFFLINE, environments_dir=str(arc_environments_dir())).make(game_id, seed=0, include_frame_data=True)
+
+
+def certify(env, level_number, actions):
   """
   The ground truth: replay a solution in the real engine.
 
-  GETS:    game_id -- e.g. "ls20-syn30"; level_number -- 1-based game level; actions -- action ids 1..4.
+  GETS:    env -- the game (make_game); level_number -- 1-based game level; actions -- action ids 1..4.
   DOES:    resets the game to that level (as arc_collection does) and plays the actions.
   RETURNS: (completed, first_frame) -- whether the level is completed, and the level's start frame (64 x 64)
            for the preview.
   """
-  import arc_agi
   import numpy as np
-  from arc_agi import OperationMode
   from arcengine import GameAction, GameState
 
   from master_thesis.environments.arc_collection import reset_at_level
 
-  arcade = arc_agi.Arcade(operation_mode=OperationMode.OFFLINE, environments_dir=str(arc_environments_dir()))
-  env = arcade.make(game_id, seed=0, include_frame_data=True)
   observation = reset_at_level(env, level_number)
   first_frame = np.asarray(observation.frame[-1])
   for action in actions:
@@ -365,11 +376,12 @@ def check_real_levels(levels=(1, 2, 3, 4)):
   RETURNS: True if every solution completes its level. Rerun this after any change to arc_solver.
   """
   module = load_game_module(source_game_file())
+  env = make_game(SOURCE_GAME)
   all_ok = True
   for number in levels:
     spec = spec_from_level(module.levels[number - 1])
     solution = solve(spec)
-    completed = solution is not None and certify(SOURCE_GAME, number, solution)[0]
+    completed = solution is not None and certify(env, number, solution)[0]
     all_ok &= completed
     print(f"real level {number}: optimal {len(solution) if solution else '-':>3} moves, mechanics {sorted(mechanics_used(spec, solution)) if solution else []} -> {'completes in the real engine' if completed else 'FAILS'}")
   return all_ok
@@ -398,9 +410,10 @@ def main():
   folder = write_game_version(args.version, [spec for _, _, spec, _ in generated])
 
   game_id, records, frames, labels = f"ls20-{args.version}", {}, [], []
+  env = make_game(game_id)  # one game for all certifications
   for index, (tier, target, spec, solution) in enumerate(generated):
     level = NUM_REAL_LEVELS + 1 + index
-    completed, frame = certify(game_id, level, solution)
+    completed, frame = certify(env, level, solution)
     if not completed:
       raise RuntimeError(f"level {level}: the solver's solution does not complete it in the real engine")
     spec_dict = asdict(spec)

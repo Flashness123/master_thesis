@@ -181,6 +181,45 @@ def solve(spec, max_states=20_000_000):
   return None
 
 
+def reachable(spec):
+  """
+  Every situation of a level that one life can reach, each with the path that gets there with the most energy left.
+
+  GETS:    spec -- the LevelSpec.
+  DOES:    BFS over the same states as solve() (cell, symbol, energy, taken refills, reached goals), but over the whole
+           level instead of stopping at the goal. A situation is a state without its energy: what the frame shows
+           apart from the energy bar. Of all states of a situation it keeps the one with the most energy, the first
+           (so shortest) one on ties. Finishing moves are left out, so no path completes the level, and transition()
+           already leaves out wall bumps and running out of energy, so no path costs a life.
+  RETURNS: {situation: (energy, path)} -- situation = (cell, shape, color, rotation, taken refills, reached goals);
+           energy = the most energy it can be reached with; path = a shortest list of action ids 1..4 to that energy.
+           The level start is the situation with path [].
+  """
+  start = (spec.start, spec.start_shape, spec.start_color, spec.start_rotation, spec.step_counter, 0, 0)
+  parent = {start: None}
+  queue = deque([start])
+  best = {}  # situation -> its state with the most energy
+  while queue:
+    state = queue.popleft()
+    situation = state[:4] + state[5:]
+    if situation not in best or state[4] > best[situation][4]:
+      best[situation] = state
+    for action in ACTIONS:
+      nxt = transition(spec, state, action)
+      if nxt is not None and nxt != "SOLVED" and nxt not in parent:
+        parent[nxt] = (state, action)
+        queue.append(nxt)
+
+  situations = {}
+  for situation, state in best.items():
+    energy, path = state[4], []
+    while parent[state] is not None:
+      state, action = parent[state]
+      path.append(action)
+    situations[situation] = (energy, path[::-1])
+  return situations
+
+
 def mechanics_used(spec, actions):
   """
   Which mechanics a solution actually needs, for tiering and for rejecting trivial levels.

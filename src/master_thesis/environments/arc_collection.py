@@ -26,7 +26,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 import arc_agi
 import numpy as np
@@ -126,7 +126,7 @@ def load_branch_points(game_id: str, dataset: str) -> dict[int, list[list[int]]]
     return per_level # return a sequence of action of that level
 
 
-def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, prefix: list[int] | None = None, branch: dict | None = None, ) -> Path:  # output_path is always chosen by collect_runs; prefix = action ids replayed (not recorded) before the policy starts
+def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path: Path, policy_name: str = "random", start_level: int | None = None, ppo_policy=None, prefix: list[int] | None = None, branch: dict | None = None, env: LocalEnvironmentWrapper | None = None, stop: Callable[[FrameDataRaw], bool] | None = None, policy=None, ) -> Path:  # output_path is always chosen by collect_runs; prefix = action ids replayed (not recorded) before the policy starts; env = a game made earlier, reused instead of making a new one; stop = an extra end condition, checked on every recorded state after an action; policy = a policy object made by the caller, used instead of making one from policy_name
     """
   Collect one ARC trajectory using a policy.
 
@@ -135,6 +135,16 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
   RESET actions caused by GAME_OVER are not counted as policy steps.
   Every initial/reset state and every state resulting from an executed
   action is recorded.
+
+  Without `env` every call makes a new game. Making one copies every level of the game file (seconds for a file with
+  1000 synthetic levels), so a collector of many runs makes the game once and passes it in. A reused game needs
+  start_level: reset_at_level then restores all its levels, as in a new game. The game seed is then the one it was
+  made with (the dynamics of ls20 do not depend on it); `seed` still seeds the policy.
+
+  `stop(observation)` returning True ends the run after that state is recorded, e.g. at the first life loss.
+
+  Without `policy` the run makes its policy from `policy_name`. With `policy` it plays that object, e.g.
+  arc_synthetic_collection's SolverWalk, which needs the level; `policy_name` then only names the run.
   """
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")
@@ -148,16 +158,20 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
         if mode == "online":
             raise ValueError("--start-level requires normal or offline mode")
 
-    environments_dir = arc_environments_dir()  # $STABLEWM_HOME/arc_environments
+    if env is None:  # a new game for this run
+        environments_dir = arc_environments_dir()  # $STABLEWM_HOME/arc_environments
 
-    environments_dir.mkdir(parents=True, exist_ok=True, )
+        environments_dir.mkdir(parents=True, exist_ok=True, )
 
-    arcade = arc_agi.Arcade(operation_mode=MODE_MAP[mode], environments_dir=str(environments_dir), ) # Arcade: scans environments_dir for metadata.json files and, in NORMAL/ONLINE mode, can use the API
+        arcade = arc_agi.Arcade(operation_mode=MODE_MAP[mode], environments_dir=str(environments_dir), ) # Arcade: scans environments_dir for metadata.json files and, in NORMAL/ONLINE mode, can use the API
 
-    env = arcade.make(game_id, seed=seed, include_frame_data=True, )  # splits "ls20-9607627b" into game + version; OFFLINE: finds the local copy; NORMAL: downloads it if needed. Returns a LocalEnvironmentWrapper, which runs the game file, creates the game with this seed, and ALREADY RESETS it. Also creates a local scorecard.
+        env = arcade.make(game_id, seed=seed, include_frame_data=True, )  # splits "ls20-9607627b" into game + version; OFFLINE: finds the local copy; NORMAL: downloads it if needed. Returns a LocalEnvironmentWrapper, which runs the game file, creates the game with this seed, and ALREADY RESETS it. Also creates a local scorecard.
 
-    if env is None:
-        raise RuntimeError(f"Could not create ARC game: {game_id}")
+        if env is None:
+            raise RuntimeError(f"Could not create ARC game: {game_id}")
+
+    elif start_level is None:
+        raise ValueError("A reused game needs start_level: only reset_at_level restores all its levels (env.reset() after a played run resets only the current level)")
 
     # observation = (env.observation_space)  # arc_agi's "observation_space" is NOT a Gym space: it is the last FrameDataRaw returned
 
@@ -177,7 +191,10 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
         if observation is None or observation.state is not GameState.NOT_FINISHED:
             raise RuntimeError("Replaying the prefix ended the game; the recorded run does not match this game")
 
-    if policy_name == "random":
+    if policy is not None:  # made by the caller
+        pass
+
+    elif policy_name == "random":
         policy = ArcRandomPolicy(seed=seed)
 
     elif policy_name == "goose":
@@ -251,6 +268,10 @@ def collect_game(game_id: str, max_steps: int, seed: int, mode: str, output_path
                     policy.choose_action(frame=np.asarray(observation.frame[-1]), available_actions=env.action_space, episode_finished=True, )
 
                 print(f"{policy_name} episode ended: {observation.state.name}")
+                break
+
+            if stop is not None and stop(observation):  # the caller's end condition, e.g. the first life loss in arc_synthetic_collection
+                print(f"{policy_name} run stopped by its end condition after {actions_executed} actions")
                 break
 
     print(f"Game: {game_id}")
