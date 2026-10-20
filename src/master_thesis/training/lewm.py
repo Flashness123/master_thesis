@@ -108,9 +108,9 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
   Convert an ARC-AGI-3 categorical 64x64 grid into RGB pixels for
   vanilla LeWM's existing 3-channel ViT encoder.
 
-  GETS:    grids [T, 4096] float32, straight from the Lance `grid` column.
+  GETS:    grids [T, 4096] uint8, straight from the Lance `grid` column (float32 in datasets written before 20.10.26).
            T = 4 during LeWM training (one 4-state window), T = 1 in ppo.py.
-           Each value is a colour INDEX 0..15, stored as float (Lance has no int columns here).
+           Each value is a colour INDEX 0..15; .long() below makes both dtypes the same indices.
   DOES:    index -> RGB via a fixed 16-colour palette, resize 64 -> img_size (nearest,
            so no new colours are invented), then ImageNet-normalize.
   RETURNS: pixels [T, 3, img_size, img_size] float32, ready for JEPA.encode's ViT.
@@ -145,7 +145,7 @@ class ArcGridToPixels:  # ARC: flattened colour grid → normalized RGB image fo
     self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel mean, shaped to broadcast over [T, 3, H, W]
     self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, ).view(1, 3, 1, 1)  # ImageNet per-channel std (conventional for ViTs; the ViT isn't pretrained here, so it's just a fixed scaling)
 
-  def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:  # grids: [T, 4096] float32 from Lance (T = 4 in training, 1 in ppo.py)
+  def __call__(self, grids: torch.Tensor, ) -> torch.Tensor:  # grids: [T, 4096] uint8 from Lance, float32 in older datasets (T = 4 in training, 1 in ppo.py)
 
     if grids.shape[-1] != 64 * 64:
       raise ValueError(f"Expected flattened ARC grids with 4096 values, got shape {tuple(grids.shape)}")

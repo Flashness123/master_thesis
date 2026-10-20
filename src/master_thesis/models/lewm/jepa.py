@@ -111,7 +111,7 @@ class JEPA(nn.Module):
     """
     Autoregressively imagine the future latents for many candidate action plans at once.
 
-    GETS:    info -- dict with "pixels" [B, S, T_hist, 3, H, W]: the SAME initial history repeated
+    GETS:    info -- dict with "pixels" [/ideB, S, T_hist, 3, H, W]: the SAME initial history repeated
                      across S candidates
              action_sequence -- [B, S, T, action_dim]: for each of S candidates, a full plan of T
                      actions. Its first T_hist entries are the actions already taken in the history;

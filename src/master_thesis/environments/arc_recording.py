@@ -5,9 +5,11 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any
-from stable_worldmodel.data.format import get_format
+import lancedb
+import pyarrow as pa
 
 from master_thesis.paths import dataset_path
 
@@ -20,7 +22,7 @@ from master_thesis.paths import dataset_path
 ├──────────┼────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
 │ Episodes │ 1 file = 1 episode (Goose/PPO)             │ episode_idx column, numbered by the writer                                                │
 ├──────────┼────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
-│ Grid     │ nested list, possibly several animation    │ only the last frame, float32 with 4096 values                                             │
+│ Grid     │ nested list, possibly several animation    │ only the last frame, uint8 with 4096 values (float32 in datasets written before 20.10.26) │
 │          │ frames                                     │                                                                                           │
 ├──────────┼────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────┤
 │ Metadata │ levels_completed, state, full_reset, guid, │ terminal, levels_completed, available_actions, game_id, start_level (0 = unknown),        │
@@ -32,7 +34,7 @@ from master_thesis.paths import dataset_path
 .lance columns:
 episode_idx          0
 step_idx             5
-grid                 list[4096] float32, values [0.0, 1.0, 3.0, 4.0, 5.0, 8.0, 9.0, 11.0, 12.0]  #different colour sin THIS frame
+grid                 list[4096] uint8, values [0, 1, 3, 4, 5, 8, 9, 11, 12]  #different colour sin THIS frame
 action               [3.0, -1.0, -1.0]  # Action taken in the current state
 terminal             [0.0]
 levels_completed     [0.0]
@@ -47,6 +49,24 @@ COLOR_COUNT = 16
 
 NUM_ACTIONS = 7
 CLICK_ACTION = 6
+
+# The Lance layout of stable-worldmodel's LanceWriter, so its reader and the training code read our tables unchanged, with
+# one difference: that writer stores every number column as float32, here the grid is uint8. The grid holds colour ids
+# 0..15, which uint8 stores exactly, and training turns them into integers first thing (ArcGridToPixels: .long()), so the
+# model sees the same pixels. A state takes 4.15 KB instead of 16.6 KB (measured on syn30: the same training windows, read
+# no slower).
+LANCE_SCHEMA = pa.schema([
+    pa.field("episode_idx", pa.int32()),  # numbered by write_lance_dataset
+    pa.field("step_idx", pa.int32()),  # position of the state in its episode
+    pa.field("grid", pa.list_(pa.uint8(), GRID_SIZE * GRID_SIZE)),
+    pa.field("action", pa.list_(pa.float32(), 3)),
+    pa.field("terminal", pa.list_(pa.float32(), 1)),
+    pa.field("levels_completed", pa.list_(pa.float32(), 1)),
+    pa.field("available_actions", pa.list_(pa.float32(), NUM_ACTIONS)),
+    pa.field("game_id", pa.string()),
+    pa.field("start_level", pa.list_(pa.float32(), 1)),
+    pa.field("episode_success", pa.list_(pa.float32(), 1)),
+])
 
 
 @dataclass
@@ -368,26 +388,60 @@ def iter_episodes(files: list[Path], levels: list[int] | None = None) -> Iterabl
 
 def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | Path, mode: str = "error", sources: list[Path] = (), levels: list[int] | None = None, ) -> None:
     """
-  Write ARC episodes using stable-worldmodel's native Lance writer
-  and record where they came from in <dataset>.json next to the table.
+  Write ARC episodes into a Lance table and record where they came from in <dataset>.json next to it.
+
+  GETS:    episodes -- episode dicts from iter_episodes (per column one list with an entry per state);
+           output_path -- datasets/<game>/<name>.lance; mode -- if the table exists: "error" refuses, "append" adds to
+           it (only to a table with LANCE_SCHEMA), "overwrite" replaces it; sources, levels -- recorded in <name>.json.
+  DOES:    streams one record batch per episode into the table in LANCE_SCHEMA (grid as uint8), numbering the episodes
+           on from those already in the table. Like stable-worldmodel's LanceWriter, <parent>/<name>.lance is the
+           table <name> of the database <parent>, which is where its reader looks.
+  RETURNS: None. Raises if there are no episodes, before an existing table is touched.
   """
     output_path = Path(output_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True, )  # datasets/<game>/
 
-    counts = {"episodes": 0, "states": 0}  # filled while the writer consumes the episodes
-
-    def counted():  # passes episodes through unchanged and counts them
-        for episode in episodes:
-            counts["episodes"] += 1
-            counts["states"] += len(episode["grid"])
-            yield episode
-
-    with get_format("lance").open_writer(output_path, mode=mode, ) as writer:  # mode: error = refuse existing, append = add, overwrite = replace
-        writer.write_episodes(counted())  # streams all episodes into one new Lance version
-
-    if counts["episodes"] == 0:
+    episodes = iter(episodes)
+    first = next(episodes, None)
+    if first is None:  # checked first, so "overwrite" never drops a table without writing a new one
         raise ValueError("No ARC episodes available to write")
+
+    database = lancedb.connect(str(output_path.parent))
+    name = output_path.stem
+    table = None
+    if name in database.list_tables().tables:
+        if mode == "error":
+            raise FileExistsError(f"{output_path} already exists; pass --mode overwrite to replace it or --mode append to extend it")
+        if mode == "overwrite":
+            database.drop_table(name)
+        else:
+            table = database.open_table(name)
+            if table.schema.field("grid").type != LANCE_SCHEMA.field("grid").type:  # e.g. a float32 table written by stable-worldmodel's LanceWriter
+                raise ValueError(f"{output_path} stores the grid as {table.schema.field('grid').type}, not uint8: write a new dataset instead of appending")
+
+    first_episode = int(table.to_lance().to_table(columns=["episode_idx"]).column("episode_idx").to_numpy().max()) + 1 if table is not None else 0  # appending numbers on after the last episode
+    counts = {"episodes": 0, "states": 0}  # filled while Lance consumes the batches
+
+    def batches():  # one record batch per episode, in LANCE_SCHEMA
+        for episode in chain([first], episodes):
+            length = len(episode["grid"])
+            columns = [pa.array(np.full(length, first_episode + counts["episodes"], dtype=np.int32)), pa.array(np.arange(length, dtype=np.int32))]
+            for field in list(LANCE_SCHEMA)[2:]:  # the episode's columns, after episode_idx and step_idx
+                if field.type == pa.string():
+                    columns.append(pa.array(episode[field.name], type=pa.string()))
+                else:  # fixed-size list: all states' values in one flat array of the column's type (bools -> 0.0/1.0), cut into rows of list_size
+                    values = np.asarray(episode[field.name], dtype=field.type.value_type.to_pandas_dtype()).reshape(-1)
+                    columns.append(pa.FixedSizeListArray.from_arrays(pa.array(values), field.type.list_size))
+            counts["episodes"] += 1
+            counts["states"] += length
+            yield pa.record_batch(columns, schema=LANCE_SCHEMA)
+
+    reader = pa.RecordBatchReader.from_batches(LANCE_SCHEMA, batches())  # streamed: only one episode in memory
+    if table is None:
+        database.create_table(name, data=reader, schema=LANCE_SCHEMA)
+    else:
+        table.add(reader)
 
     record_path = output_path.with_suffix(".json")  # datasets/<game>/<dataset>.json
     record = json.loads(record_path.read_text(encoding="utf-8")) if mode == "append" and record_path.exists() else {"writes": []}  # appending keeps the earlier history

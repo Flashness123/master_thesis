@@ -32,7 +32,7 @@ NUM_ACTIONS = 7  # ARC action types ACTION1..ACTION7 (0 is the dummy action on a
 def load_columns(game: str, dataset_name: str):
   """Read the columns needed here from datasets/<game>/<dataset_name>.lance."""
   dataset = swm.data.load_dataset(str(dataset_path(game, dataset_name)), num_steps=1)  # windows are not used; we only need columns and episode boundaries
-  grids = dataset.get_col_data("grid").astype(np.uint8)  # [rows, 4096] colour indices (stored as float32 in Lance)
+  grids = dataset.get_col_data("grid").astype(np.uint8)  # [rows, 4096] colour indices (uint8 in Lance, float32 in datasets written before 20.10.26)
   actions = dataset.get_col_data("action")[:, 0].astype(int)  # action id taken in each state (0 = dummy on the last state)
   levels = dataset.get_col_data("start_level")[:, 0].astype(int)  # level the row's episode plays
   successes = dataset.get_col_data("episode_success")[:, 0].astype(bool)  # did the row's episode complete its level?
