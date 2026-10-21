@@ -142,7 +142,7 @@ def collect_synthetic(game_id, max_runs, max_steps, seed, levels=None, name=None
       run_seed = seed + level * SEED_LEVEL_OFFSET + run_index
       situation = unvisited[int(np.random.default_rng(run_seed).integers(len(unvisited)))]  # uniform over the start situations nobody has visited yet
       energy, path = starts[situation]
-      branch = {"source": "reachable", "cell": list(situation[0]), "path_length": len(path), "energy": energy}  # stored on the first recorded line, like arc_collection's branches
+      branch = {"source": "reachable", "cell": list(situation[0]), "path_length": len(path), "energy": energy, "prefix": path}  # stored on the first recorded line, like arc_collection's branches; prefix = the replayed path, so the run's start can be rebuilt in the engine (evaluation/lewm_analysis)
       print(f"\n--- level {level}, run {run_index + 1} (seed={run_seed}, start at cell {situation[0]}: {len(path)} moves from the level start, energy {energy}/{spec.step_counter}; {len(unvisited)} of {len(starts)} start situations unvisited) ---")
       walk = SolverWalk(spec, (*situation[:4], energy, *situation[4:]), seed=run_seed)  # starts at the situation the path leads to
       output_path = collect_game(game_id=game_id, max_steps=max_steps, seed=run_seed, mode="offline", output_path=level_dir / f"walk_seed{run_seed}.jsonl", policy_name="walk", start_level=level,

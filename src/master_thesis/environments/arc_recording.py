@@ -11,7 +11,7 @@ from typing import Any
 import lancedb
 import pyarrow as pa
 
-from master_thesis.paths import dataset_path
+from master_thesis.paths import dataset_path, stablewm_home
 
 """
 ┌──────────┬────────────────────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────┐
@@ -380,9 +380,15 @@ def recording_files(source: Path) -> list[Path]:  # one .jsonl file, or every .j
 
 
 def iter_episodes(files: list[Path], levels: list[int] | None = None) -> Iterable[dict[str, list]]:  # yields Lance episodes file by file (only one file in memory)
+    home = stablewm_home().resolve()
     for file in files:
-        for episode in build_lance_episodes(build_transitions(load_recording(file))):  # converted per file, so episodes of different files never merge
+        events = load_recording(file)
+        prefix = (events[0].get("branch") or {}).get("prefix") or []  # actions replayed (not recorded) before the file's first line: synthetic walk runs; [] = it starts at the level start
+        for index, episode in enumerate(build_lance_episodes(build_transitions(events))):  # converted per file, so episodes of different files never merge
             if levels is None or episode["start_level"][0] in levels:  # keep only episodes that play one of the requested levels
+                source = file.resolve()
+                episode["provenance"] = {"source": str(source.relative_to(home) if source.is_relative_to(home) else source), "episode_in_file": index, "start_level": int(episode["start_level"][0]),
+                                         "prefix": prefix if index == 0 else []}  # not a Lance column: write_lance_dataset puts it into <dataset>.episodes.jsonl; later episodes of a file start at a level start (after a reset or a completion)
                 yield episode
 
 
@@ -390,12 +396,15 @@ def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | 
     """
   Write ARC episodes into a Lance table and record where they came from in <dataset>.json next to it.
 
-  GETS:    episodes -- episode dicts from iter_episodes (per column one list with an entry per state);
+  GETS:    episodes -- episode dicts from iter_episodes (per column one list with an entry per state, and "provenance");
            output_path -- datasets/<game>/<name>.lance; mode -- if the table exists: "error" refuses, "append" adds to
            it (only to a table with LANCE_SCHEMA), "overwrite" replaces it; sources, levels -- recorded in <name>.json.
   DOES:    streams one record batch per episode into the table in LANCE_SCHEMA (grid as uint8), numbering the episodes
            on from those already in the table. Like stable-worldmodel's LanceWriter, <parent>/<name>.lance is the
-           table <name> of the database <parent>, which is where its reader looks.
+           table <name> of the database <parent>, which is where its reader looks. Next to it, <name>.episodes.jsonl
+           gets one line per episode, written in the same loop so the numbers match: {"episode_idx", "source" (the
+           recording, relative to $STABLEWM_HOME), "episode_in_file", "start_level", "prefix" (actions to replay from
+           the level start before the episode's first state; [] when it starts there)}. Appending adds lines.
   RETURNS: None. Raises if there are no episodes, before an existing table is touched.
   """
     output_path = Path(output_path)
@@ -423,9 +432,10 @@ def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | 
     first_episode = int(table.to_lance().to_table(columns=["episode_idx"]).column("episode_idx").to_numpy().max()) + 1 if table is not None else 0  # appending numbers on after the last episode
     counts = {"episodes": 0, "states": 0}  # filled while Lance consumes the batches
 
-    def batches():  # one record batch per episode, in LANCE_SCHEMA
+    def batches():  # one record batch per episode, in LANCE_SCHEMA, and its provenance line
         for episode in chain([first], episodes):
             length = len(episode["grid"])
+            provenance.write(json.dumps({"episode_idx": first_episode + counts["episodes"], **episode.get("provenance", {})}) + "\n")
             columns = [pa.array(np.full(length, first_episode + counts["episodes"], dtype=np.int32)), pa.array(np.arange(length, dtype=np.int32))]
             for field in list(LANCE_SCHEMA)[2:]:  # the episode's columns, after episode_idx and step_idx
                 if field.type == pa.string():
@@ -438,10 +448,11 @@ def write_lance_dataset(episodes: Iterable[dict[str, list]], output_path: str | 
             yield pa.record_batch(columns, schema=LANCE_SCHEMA)
 
     reader = pa.RecordBatchReader.from_batches(LANCE_SCHEMA, batches())  # streamed: only one episode in memory
-    if table is None:
-        database.create_table(name, data=reader, schema=LANCE_SCHEMA)
-    else:
-        table.add(reader)
+    with output_path.with_suffix(".episodes.jsonl").open("a" if table is not None else "w", encoding="utf-8") as provenance:  # open while Lance consumes the batches
+        if table is None:
+            database.create_table(name, data=reader, schema=LANCE_SCHEMA)
+        else:
+            table.add(reader)
 
     record_path = output_path.with_suffix(".json")  # datasets/<game>/<dataset>.json
     record = json.loads(record_path.read_text(encoding="utf-8")) if mode == "append" and record_path.exists() else {"writes": []}  # appending keeps the earlier history
