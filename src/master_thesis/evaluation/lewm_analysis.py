@@ -593,11 +593,10 @@ class AnalysisContext:
   parameters: argparse.Namespace
   model: torch.nn.Module
   info: dict
-  episodes: dict  # split -> (its episodes, {dataset: Lance version}); cem_planning picks its episodes from them
-  sets: dict  # split -> EvaluationSet
-  latents: dict  # split -> encode_evaluation_set's dict
-  compare_to: tuple | None  # the --compare-to checkpoint as (model, info, {split: latents}), or None
-
+  episodes: dict  # (seen_train, seen_val, unseen) for cem_planning - whole solution from paths from beginning to end
+  sets: dict  # three EvaluationSets (seen_train, seen_val, unseen), different from episodes as they dont include whole runs
+  latents: dict  # EvaluationSets encoded
+  compare_to: tuple | None  # the --compare-to checkpoint
 
 def metric_row(experiment: str, name: str, split: str, value, n: int, level="all", subset: str = "all", group: str | None = None) -> dict:
   """One row of the metrics table. The group is the experiment's dashboard group unless given; level and subset are "all" or a specific value."""
@@ -608,10 +607,7 @@ def metric_row(experiment: str, name: str, split: str, value, n: int, level="all
 
 def metric_rows_per_level(experiment: str, name: str, split: str, values, levels, subset: str = "all", denominator=None, group: str | None = None) -> list:
   """
-  Turn one value per item (a state, an action, a window, ...) into metric rows: the average over all items and the
-  average within each level. Missing values (NaN) are left out.
-  With `denominator`, each row holds the ratio of the two averages instead, e.g. prediction error divided by copy
-  error (NaN if the denominator's average is 0).
+  We get the State, Level, Error values and compute averages from them: one over everything, and one per level. Then we write them with the help of metric_row
   """
   values, levels = np.asarray(values, dtype=float), np.asarray(levels)
   denominator = np.ones_like(values) if denominator is None else np.asarray(denominator, dtype=float)
@@ -627,16 +623,14 @@ def metric_rows_per_level(experiment: str, name: str, split: str, values, levels
 @torch.no_grad()
 def encode_actions(context: AnalysisContext):
   """
-  Encode the 4 moves (up, down, left, right) with the model's action encoder, as the planner does: one-hot over the 7
-  action types, no click position. The action encoder looks at each step on its own, so these also work inside
-  sequences of actions. Returns 4 action latents.
+  Encode the 4 moves (up, down, left, right) with the model's action encoder [1 0 0 0 0 0 0 | 0 0] -> 192 dims , then we save the actions because they dont change
   """
   return context.model.action_encoder(torch.eye(len(ACTIONS), ACTION_DIM, device=context.parameters.device)[:, None])[:, 0]
 
 
 @torch.no_grad()
 def predict_next_latent(context: AnalysisContext, latents, actions):
-  """Predict the next latent from one real latent and one action id (1-4), like the planner's first step. Runs in batches; the model is in eval mode, so there is no dropout."""
+  """Predict the next latent from one real latent and one action id (1-4), like the planner's first step"""
   device, encoded_actions = context.parameters.device, encode_actions(context)
   predictions = [context.model.predict(torch.as_tensor(latents[start:start + BATCH_SIZE], device=device)[:, None], encoded_actions[torch.as_tensor(np.asarray(actions[start:start + BATCH_SIZE]) - 1, device=device)][:, None])[:, -1].float().cpu()
                  for start in range(0, len(latents), BATCH_SIZE)]
@@ -646,11 +640,7 @@ def predict_next_latent(context: AnalysisContext, latents, actions):
 def train_probe(inputs, targets, outputs: int, steps: int, seed: int, device: str, probe=None, class_weight=None):
   """
   Train a small MLP probe on frozen latents, or keep training an existing one (to fine-tune it on unseen levels).
-
-  Every checkpoint gets the same probe (192 -> 256 -> outputs), the same optimizer and the same number of steps (batches
-  of 256 random training states), so the results compare. For classes (outputs > 1), rare classes get a higher loss
-  weight, so the probe cannot score well by always predicting the most common answer; we score with balanced accuracy,
-  which treats every class equally. For numbers (outputs = 1) the targets are standardized.
+  Every checkpoint gets the same probe (192 -> 256 -> outputs), the same optimizer and the same number of steps. For classes (outputs > 1), rare classes get a higher loss weight
   """
   torch.manual_seed(seed)
   probe = probe if probe is not None else torch.nn.Sequential(torch.nn.Linear(inputs.shape[1], 256), torch.nn.ReLU(), torch.nn.Linear(256, outputs))
@@ -671,12 +661,7 @@ def train_probe(inputs, targets, outputs: int, steps: int, seed: int, device: st
 
 class CemPlanner:
   """
-  Plan with the world model, as evaluation/arc_policies.py LewmRolloutPlanner does: CEM (stable-worldmodel's
-  CategoricalCEMSolver) tries many action sequences, the model imagines where each one leads, and we play the first
-  replan_every actions of the best one before planning again.
-
-  A plan is scored by how close its imagined states come to the goal: by default the closest point along the way
-  ("path"), or only the last imagined state ("end", which is what LeWM itself uses).
+  Plan with the world model, as LewmRolloutPlanner does: tries many action sequences, the model imagines where each one leads, and we play the first replan_every actions
   """
 
   def __init__(self, model, img_size: int, goal_grid, parameters):
@@ -723,19 +708,8 @@ class CemPlanner:
 
 def latent_variance(context: AnalysisContext, split: str):
   """
-  Is the representation collapsed, and does it mostly store which level we are in?
-
-  If the encoder puts every state at almost the same point, the latents hardly vary (collapse). But a healthy-looking
-  overall variance is not enough: ls20 levels look very different from each other, so most of the variance can come
-  from "which level is this" alone. That is why we also measure the variance within each level. If it is tiny compared
-  to the overall variance, the encoder hardly sees what happens inside a level (like where the player stands), even
-  though that is what planning needs.
-
-  Data: the latents of the split's picked states.
-  How: the variance of each of the 192 latent numbers over the states, averaged over the 192 numbers; once over all
-  states and once within each level.
-  Result: latent_variance (over all levels and per level) and within_level_share (the average within-level variance
-  divided by the overall variance).
+  This doesnt test gaussianity at all! Instead we take the 192 dims and calculate its total variance and then do that for every single level by encoding different states of that level and looking how much latent vectors vary across different states
+  If it barely changes but the total variance is high, it suggests we occupy a lot of the space with level identification and not so much by dynamics
   """
   latents, levels = context.latents[split]["state"], context.sets[split].states.level.to_numpy()
   if len(latents) < 2:
@@ -754,20 +728,18 @@ def latent_variance(context: AnalysisContext, split: str):
 def state_probes(context: AnalysisContext):
   """
   Which facts about the game can be read from the latent, and does that still work in levels the model never saw?
-
-  A probe is a small MLP that gets the frozen latent of a state and has to predict one fact about it. If it can, the
-  encoder has kept that information. The facts (from read_game_state and from what the actions did):
+  Implemented as a small MLP per fact that gets the frozen latent of a state and has to predict one fact about it. 
     level                                       which level it is (only on seen levels: there is no answer for a new level)
     player_x, player_y                          where the player is
-    energy, lives
+    energy, lives                               current step and lifes left, ground truth taken from the game engine
     key_shape, key_color, key_rotation          the symbol the player carries
     goal_shape, goal_color, goal_rotation       the symbol the nearest goal needs
     key_matches_goal                            does the player's symbol fit that goal?
-    goal_distance                               how many moves away the nearest goal is
+    goal_distance                               grid distance to the nearest goal (Manhattan, walls ignored)
     refill_left, refill_x, refill_y             is a refill left, and where is the nearest one?
     rotator_present, rotator_x, rotator_y       is there a rotator, and where is the nearest one?
     success_up, _down, _left, _right            would this move work? (e.g. right fails when a wall is to the right)
-  Facts with a few possible answers are scored with balanced accuracy, numbers with the average absolute error (mae).
+  Facts with a few possible answers are scored with balanced accuracy, numbers with the mean absolute error.
 
   How the splits are used:
     - train on seen_train, test on seen_train and on seen_val. seen_val holds other episodes of the same levels, so a
@@ -780,8 +752,6 @@ def state_probes(context: AnalysisContext):
   level_baseline, the latent only tells us the level, not the fact itself. varying_levels says in what share of the
   levels the fact changes at all: a fact that never changes inside a level can be solved by knowing the level.
   A fact with fewer than 10 known training states or always the same answer is skipped (and printed).
-  Results on seen splits belong to the dashboard group encoder, results on unseen levels to generalization.
-  The probes are trained once and tested on every split, so this runs once for all splits.
   """
   from sklearn.metrics import balanced_accuracy_score
 

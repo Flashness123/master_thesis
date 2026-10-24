@@ -1,6 +1,7 @@
 """
 Training data for the synthetic ls20 levels (made by arc_levelgen): each level's optimal solution, and one-life runs
-that start anywhere in the level.
+that start anywhere in the level. The real levels 1-4 work the same way: their spec is read from the game file and
+solved here (5-7 have changers moving on tracks, which arc_solver cannot model).
 
 One call creates one collection, structured like the real recordings so arc_recording converts it unchanged:
 $STABLEWM_HOME/synthetic_data/<game>/
@@ -45,8 +46,8 @@ import json
 import numpy as np
 
 from master_thesis.environments.arc_collection import SEED_LEVEL_OFFSET, collect_game, levels_tag, record_frame, reset_at_level
-from master_thesis.environments.arc_levelgen import make_game, source_game_file
-from master_thesis.environments.arc_solver import Goal, LevelSpec, reachable
+from master_thesis.environments.arc_levelgen import NUM_REAL_LEVELS, load_game_module, make_game, source_game_file, spec_from_level
+from master_thesis.environments.arc_solver import Goal, LevelSpec, reachable, solve
 from master_thesis.paths import synthetic_dir, timestamp
 from master_thesis.policies.arc_solver_walk import SolverWalk
 
@@ -110,7 +111,8 @@ def collect_synthetic(game_id, max_runs, max_steps, seed, levels=None, name=None
 
   GETS:    game_id -- e.g. "ls20-syn30"; max_runs -- most runs per level; max_steps -- walk actions per run;
            seed -- base seed (run seed = seed + level * SEED_LEVEL_OFFSET + run index, as in arc_collection);
-           levels -- level numbers to collect (default: all synthetic levels); name -- collection name without timestamp.
+           levels -- level numbers to collect (default: all synthetic levels; the real levels 1-4 can be added);
+           name -- collection name without timestamp.
   DOES:    per level: solution.jsonl, then runs that each start in a start situation no earlier run of the level has
            visited (see the module docstring) and end at their first life loss or level completion, until every start
            situation has been visited or max_runs is reached. All recordings share one game (arc_levelgen.make_game).
@@ -118,6 +120,7 @@ def collect_synthetic(game_id, max_runs, max_steps, seed, levels=None, name=None
   """
   synthetic_levels = load_levels(game_id)
   levels = sorted(synthetic_levels) if levels is None else levels
+  real_levels = load_game_module(source_game_file(game_id)).levels[:NUM_REAL_LEVELS] if min(levels) <= NUM_REAL_LEVELS else []  # levels.json has only the synthetic levels: the real ones come from the game file
   version = game_id.split("-", 1)[1]
   collection_dir = synthetic_dir(game_id) / f"{name or f'{version}_walk-reachable_{levels_tag(levels)}'}_{timestamp()}"
   collection_dir.mkdir(parents=True, exist_ok=False)  # never mix two collections
@@ -128,7 +131,11 @@ def collect_synthetic(game_id, max_runs, max_steps, seed, levels=None, name=None
 
   env = make_game(game_id)  # one game for all recordings: making one per run would copy all levels of the game file every time
   for level in levels:
-    spec, solution = synthetic_levels[level]
+    if level <= NUM_REAL_LEVELS:
+      spec = spec_from_level(real_levels[level - 1])  # raises for levels 5-7 (moving changers)
+      solution = solve(spec)  # record_solution below checks it in the real engine, as certify does for the synthetic levels
+    else:
+      spec, solution = synthetic_levels[level]
     level_dir = collection_dir / f"level_{level}"
     record_solution(env, level, solution, level_dir / "solution.jsonl")
     situations = reachable(spec)
@@ -164,7 +171,7 @@ def main():
   parser.add_argument("--max-runs", type=int, default=1000, help="most runs per level; a level ends earlier once every start situation has been visited (syn30, simulated: 30-722 runs)")
   parser.add_argument("--max-steps", type=int, default=500, help="maximum walk actions per run")
   parser.add_argument("--seed", type=int, default=42)
-  parser.add_argument("--levels", type=int, nargs="+", default=None, help="levels to collect (default: all synthetic levels)")
+  parser.add_argument("--levels", type=int, nargs="+", default=None, help="levels to collect (default: all synthetic levels); the real levels 1-4 work too, e.g. --levels 1 2 4")
   parser.add_argument("--name", default=None, help="collection name without timestamp; default <version>_walk-reachable_<levels>")
   args = parser.parse_args()
   if args.max_runs < 1 or args.max_steps < 1:
