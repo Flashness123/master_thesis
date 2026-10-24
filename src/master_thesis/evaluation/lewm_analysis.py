@@ -6,6 +6,8 @@
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ state_probes                                        │ latent + game state (+ move success)                 │ states             │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
+│ action_decoding                                     │ latent change of every move that changed the game    │ states             │
+├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ state_aliasing                                      │ latent + what the 4 moves did                        │ states             │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ one_step_prediction                                 │ state + its recorded next state                      │ states (next_grid) │
@@ -14,7 +16,7 @@
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ action_ranking                                      │ state + 4 outcomes + the state 5 steps later         │ states (goal_grid) │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
-│ multi_step_rollout                                  │ state + 10 recorded actions + the 10 states after it │ windows            │
+│ multi_step_rollout                                  │ state + 2 before it + 10 actions + 10 states after   │ windows            │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ cem_planning                                        │ whole solutions                                      │ its own episodes   │
 └─────────────────────────────────────────────────────┴──────────────────────────────────────────────────────┴────────────────────┘
@@ -33,7 +35,7 @@ used to fine-tune the probes on the new levels, "eval" is where the probes are t
 How the script works:
   1. Load the checkpoint and read from its training config how it was trained.
   2. Find the episodes of the three splits.
-  3. Pick the states to look at: per level 200 states and 50 rollout windows (11 recorded states in a row). The picks
+  3. Pick the states to look at: per level 200 states and 50 rollout windows (13 recorded states in a row). The picks
      depend only on the data and the seed, so every checkpoint is tested on exactly the same states.
   4. Replay the picked episodes in the real game and check that every grid matches the recording. At each picked state,
      read what the game knows (where the player is, the symbol, energy, lives, the nearest goal, ...) and try all 4
@@ -45,12 +47,13 @@ The experiments, in the groups the dashboard will show:
   encoder: does the representation keep the information needed to tell possible futures apart?
     latent_variance         is the representation collapsed, and does it mostly store which level we are in?
     state_probes            which facts about the game can be read from the latent?
+    action_decoding         can the move be read from how the latent changes? (what Delta-JEPA trains for)
     state_aliasing          do states that look close to the model really behave the same in the game?
     latent_maps             PCA and UMAP maps of the latents, only for looking at them
     checkpoint_similarity   how similar are the representations of two checkpoints? (only with --compare-to)
   predictor: given a useful representation, does the predictor know how actions change the future?
     counterfactual_actions  does it know what each of the 4 actions would do from the same state?
-    multi_step_rollout      does the error grow when it keeps predicting from its own predictions?
+    multi_step_rollout      does the error grow when it keeps predicting from its own predictions? does real history help?
   world_model: how well do encoder and predictor together predict the next state?
     one_step_prediction     the next state from one frame and the action, compared with "nothing changes"
   planning: can the model steer the game?
@@ -59,6 +62,7 @@ The experiments, in the groups the dashboard will show:
   generalization: what changes between known and new data?
     split_gaps              for every metric: seen_val minus seen_train, and unseen minus seen_val
     state_probes            its results on the unseen levels (zero-shot and fine-tuned) belong to this group
+    action_decoding         its results on the unseen levels (zero-shot and fine-tuned) belong to this group
 Every metric row carries its group, so the dashboard can sort them without knowing the experiments.
 
 How a step changed the grid is sorted into three kinds (classify_change):
@@ -120,9 +124,9 @@ EXPERIMENT_PARAMETERS = {"full": {
   # which states the experiments look at
   "seen_levels": 100,           # seen levels evaluated, the same for seen_train and seen_val: all real levels plus a random choice of the others (0 = all)
   "states_per_level": 200,      # picked at random from all states of the level's episodes
-  "windows_per_level": 50,      # rollout windows: 11 recorded states in a row
+  "windows_per_level": 50,      # rollout windows: 13 recorded states in a row (history - 1 before the rollout start, the start, 10 after it)
   "goal_ahead": 5,              # action_ranking: the goal is the recorded state this many steps later
-  "history": 3,                 # counterfactual_actions: real frames it predicts from (the state and the ones before it; fewer at an episode start, never more than the model's history_size)
+  "history": 3,                 # counterfactual_actions and multi_step_rollout: most real frames they predict from (the state and the ones before it; never more than the model's history_size)
   # state_probes and state_aliasing
   "probe_steps": 2000,          # training steps (batches of 256) on seen_train
   "probe_adapt_steps": 300,     # fine-tuning steps on the unseen adapt half
@@ -144,9 +148,9 @@ EXPERIMENT_PARAMETERS["smoke"] = {**EXPERIMENT_PARAMETERS["full"], "seen_levels"
 
 # The dashboard's groups and the experiments in them. state_probes appears twice: its seen-level results belong to
 # encoder, its unseen-level results to generalization.
-DASHBOARD_GROUPS = {"encoder": ("latent_variance", "state_probes", "state_aliasing", "latent_maps", "checkpoint_similarity"),
+DASHBOARD_GROUPS = {"encoder": ("latent_variance", "state_probes", "action_decoding", "state_aliasing", "latent_maps", "checkpoint_similarity"),
                     "predictor": ("counterfactual_actions", "multi_step_rollout"), "world_model": ("one_step_prediction",),
-                    "planning": ("cem_planning", "action_ranking"), "generalization": ("state_probes", "split_gaps")}
+                    "planning": ("cem_planning", "action_ranking"), "generalization": ("state_probes", "action_decoding", "split_gaps")}
 
 
 ##########################
@@ -419,16 +423,16 @@ def sample_states_and_windows(split: str, episodes, parameters):
     - 50 windows at random, only for multi_step_rollout
   Per level (each level has its own random generator, so adding or removing a level never changes the picks of the others):
     - states: pick states_per_level at random from all states of the level's episodes. Two kinds of states are never picked: the last state of an episode that completed the level (it already shows the next level), and a game over (no action can be played there).
-    one-step and rollout results come from slightly different mixes of episodes, because rollout discard episodes of 10 or shorter because it aslo rollouts up to 10 times
-  Every usable state of every episode has the same chance, so long episodes give more states than short ones. 
+    one-step and rollout results come from slightly different mixes of episodes, because rollout discard episodes of 12 or shorter: a window holds the 2 real frames before its rollout start and rolls out up to 10 times
+  Every usable state of every episode has the same chance, so long episodes give more states than short ones.
   """
-  horizon = ROLLOUT_HORIZONS[-1]
+  span = ROLLOUT_HORIZONS[-1] + parameters.history - 1  # steps a window covers after its first state: the real frames before the rollout start, then the horizon
   states, windows = [], []
   for level in sorted(set(episodes.level)):
     rng = np.random.default_rng([parameters.seed, SPLITS.index(split), level])
     level_episodes = episodes[episodes.level == level]
     usable = (level_episodes.length - (level_episodes.success | level_episodes.terminal_end)).to_numpy()  # states we may pick in each episode
-    starts = np.maximum(level_episodes.length.to_numpy() - horizon, 0)  # possible window starts in each episode
+    starts = np.maximum(level_episodes.length.to_numpy() - span, 0)  # possible window starts in each episode
     for picked, available, count in ((states, usable, parameters.states_per_level), (windows, starts, parameters.windows_per_level)):
       owner = np.repeat(np.arange(len(level_episodes)), available)  # every candidate of the level: its episode ...
       step = np.arange(len(owner)) - np.repeat(np.cumsum(available) - available, available)  # ... and its step in that episode
@@ -455,8 +459,9 @@ class EvaluationSet:
     windows   one row per rollout window: where it starts
     arrays    the grids: grid, next_grid, goal_grid (the state goal_ahead steps later), outcome_grid (after each of
               the 4 actions), history_grid (the history - 1 recorded grids before the state, oldest first; zeros before the
-              episode start) and history_action (the actions taken in them), window_grid (11 grids per window) and
-              window_action (the 10 actions between them)
+              episode start) and history_action (the actions taken in them), window_grid (13 grids per window: the
+              history - 1 real frames before the rollout start, the start, 10 after it) and window_action (the 12
+              actions between them)
   """
   split: str
   counts: dict
@@ -477,11 +482,11 @@ def build_evaluation_set(split: str, episodes, versions: dict, parameters) -> Ev
   Everything here depends only on the data and the seed, so every checkpoint gets exactly the same set.
   """
   states, windows = sample_states_and_windows(split, episodes, parameters)
-  horizon = ROLLOUT_HORIZONS[-1]
+  span = ROLLOUT_HORIZONS[-1] + parameters.history - 1  # steps a window covers after its first state, as in sample_states_and_windows
 
   # for every episode we need: its row in `episodes`, and the last of its rows we need (a picked state's next state and goal, or a window's end)
   needed = {}
-  for table, extra in ((states, max(1, parameters.goal_ahead)), (windows, horizon)):
+  for table, extra in ((states, max(1, parameters.goal_ahead)), (windows, span)):
     for row in table.itertuples(index=False):
       key = (row.dataset, row.episode)
       needed[key] = (row, max(min(row.step + extra, row.length - 1), needed[key][1] if key in needed else 0))
@@ -551,8 +556,8 @@ def build_evaluation_set(split: str, episodes, versions: dict, parameters) -> Ev
     raise RuntimeError(f"{split}: {int(mismatched.sum())} states are in another level than their episode's start_level")
 
   windows = windows[[(row.dataset, row.episode) in ok for row in windows.itertuples(index=False)]].reset_index(drop=True)
-  window_grid = np.stack([recorded[(row.dataset, row.episode)]["grid"][row.step:row.step + horizon + 1] for row in windows.itertuples(index=False)]) if len(windows) else np.zeros((0, horizon + 1, 4096), np.uint8)
-  window_action = np.stack([recorded[(row.dataset, row.episode)]["action"][row.step:row.step + horizon] for row in windows.itertuples(index=False)]) if len(windows) else np.zeros((0, horizon), int)
+  window_grid = np.stack([recorded[(row.dataset, row.episode)]["grid"][row.step:row.step + span + 1] for row in windows.itertuples(index=False)]) if len(windows) else np.zeros((0, span + 1, 4096), np.uint8)
+  window_action = np.stack([recorded[(row.dataset, row.episode)]["action"][row.step:row.step + span] for row in windows.itertuples(index=False)]) if len(windows) else np.zeros((0, span), int)
 
   if dropped:
     print(f"WARNING {split}: {len(replayed) - len(ok)} of {len(replayed)} episodes dropped ({dropped}); their states and windows are not evaluated")
@@ -573,7 +578,7 @@ def encode_evaluation_set(model, info: dict, evaluation_set: EvaluationSet, para
     - goal: their states 5 steps later (for action ranking);
     - outcome: the 4 grids after each move, per state;
     - history: the recorded states before each state (for counterfactual_actions), NaN before the episode start;
-    - window: the 11 frames of each rollout window.
+    - window: the 13 frames of each rollout window.
   """
   names = ("state", "next", "goal", "outcome", "history", "window")
   arrays = evaluation_set.arrays
@@ -840,6 +845,75 @@ def state_probes(context: AnalysisContext):
   return rows
 
 
+def action_decoding(context: AnalysisContext):
+  """
+  Can the move be read from how the latent changes? This is what Delta-JEPA trains its action decoder for
+  (val/action_accuracy), measured here the same way for every model, with or without a decoder.
+
+  Data: every picked state and the real outcomes of all 4 moves from the replay, so all moves are equally common.
+  Only moves that changed the game count (change kind mechanics): a blocked move only costs energy and looks the same
+  whichever direction was pressed, so no model can tell those apart (Delta-JEPA leaves them out as well).
+  How: a small MLP, as in state_probes, gets the latent change z(after the move) - z(before) and has to name the move.
+  balanced_accuracy: 1 = every move recognized, 0.25 = chance. If the latent change does not depend on the direction,
+  the planner cannot tell where its moves lead. The splits are used as in state_probes:
+    - probe: trained on seen_train, tested on seen_train and seen_val.
+    - zero_shot: the same probe on the eval half of the unseen levels: does the same readout work in new levels?
+    - adapted: a copy fine-tuned on the unseen adapt half (probe_adapt_steps), tested on the same eval states. If
+      zero_shot is low, this tells why: high adapted = the move is in the latent change, but stored differently in new
+      levels; low adapted = it is missing. adapted_minus_zero_shot is the difference.
+  """
+  from sklearn.metrics import balanced_accuracy_score
+
+  parameters = context.parameters
+  if "seen_train" not in context.sets:
+    print("action_decoding: skipped (needs the seen_train split)")
+    return []
+  splits = [name for name in SPLITS if name in context.sets]
+
+  def moves(name, part=None):  # latent change, move (0-3) and level of every move that changed the game (of one half of the unseen levels if part is given)
+    evaluation_set, latents = context.sets[name], context.latents[name]
+    keep = evaluation_set.outcomes.sort_values(["state", "action"]).change.to_numpy().reshape(-1, len(ACTIONS)) == "mechanics"  # per state and move
+    if part is not None:
+      keep &= (evaluation_set.states.part.to_numpy() == part)[:, None]
+    change = latents["outcome"] - latents["state"][:, None]  # [states, 4, 192]
+    return change[keep], np.nonzero(keep)[1], np.repeat(evaluation_set.states.level.to_numpy()[:, None], len(ACTIONS), axis=1)[keep]
+
+  change, move, _ = moves("seen_train")
+  counts = np.bincount(move, minlength=len(ACTIONS))
+  if counts.min() < 10:
+    print(f"action_decoding: skipped (moves per direction in seen_train: {counts.tolist()})")
+    return []
+  mean, std = change.mean(axis=0), change.std(axis=0) + 1e-6  # every split standardized like the training moves
+  class_weight = len(move) / (len(ACTIONS) * counts)
+  probe = train_probe((change - mean) / std, move, len(ACTIONS), parameters.probe_steps, parameters.seed, parameters.device, class_weight=class_weight)
+  guess = lambda model, change: model(torch.as_tensor((change - mean) / std, dtype=torch.float32, device=parameters.device)).argmax(dim=1).detach().cpu().numpy()
+
+  def results(subset, split, truth, guessed, levels):  # balanced accuracy over all moves and per level
+    group = "generalization" if split == "unseen" else "encoder"
+    rows = [metric_row("action_decoding", "balanced_accuracy", split, balanced_accuracy_score(truth, guessed), len(truth), subset=subset, group=group)]
+    for level in np.unique(levels):
+      selected = levels == level
+      rows.append(metric_row("action_decoding", "balanced_accuracy", split, balanced_accuracy_score(truth[selected], guessed[selected]), selected.sum(), level=int(level), subset=subset, group=group))
+    return rows
+
+  rows = []
+  for split in splits:
+    change, truth, levels = moves(split, "eval" if split == "unseen" else None)
+    if not len(truth):
+      continue
+    probe_guess = guess(probe, change)
+    rows += results("zero_shot" if split == "unseen" else "probe", split, truth, probe_guess, levels)
+    if split != "unseen":
+      continue
+    adapt_change, adapt_move, _ = moves(split, "adapt")
+    if not len(adapt_move):
+      continue
+    adapted = guess(train_probe((adapt_change - mean) / std, adapt_move, len(ACTIONS), parameters.probe_adapt_steps, parameters.seed, parameters.device, probe=copy.deepcopy(probe), class_weight=class_weight), change)
+    rows += results("adapted", split, truth, adapted, levels)
+    rows.append(metric_row("action_decoding", "balanced_accuracy", split, balanced_accuracy_score(truth, adapted) - balanced_accuracy_score(truth, probe_guess), len(truth), subset="adapted_minus_zero_shot", group="generalization"))
+  return rows
+
+
 def state_aliasing(context: AnalysisContext, split: str):
   """
   Do states that are close together in latent space really behave the same in the game? Are they too close together?
@@ -1075,35 +1149,46 @@ def counterfactual_actions(context: AnalysisContext, split: str):
 
 def multi_step_rollout(context: AnalysisContext, split: str):
   """
-  Does the error grow when the model keeps predicting from its own predictions?
+  Does the error grow when the model keeps predicting from its own predictions, and does real history help?
 
   When the planner thinks ahead, it predicts the next state, then predicts from that prediction, and so on. Small
   mistakes can add up over the steps. The rollout loss is meant to prevent that, so this shows whether it works.
 
-  Data: the split's rollout windows: 11 recorded states in a row and the 10 actions between them.
-  How: give the model only the first real state and the actions. It predicts one step at a time and always uses its
-  own predictions as the history for the next step (it looks at its last history_size latents, like the planner): its
-  history is gathered by itself, it never sees a second real frame.
+  Data: the split's rollout windows: 13 recorded states in a row and the 12 actions between them. The rollout starts at
+  the 3rd state; the 2 before it are its real history.
+  How: give the model the start state and the actions. It predicts one step at a time and always uses its own
+  predictions as the history for the next step (it looks at its last history_size latents, like the planner): its
+  history is gathered by itself. This is done 3 times on the same windows: from the start state alone (subsets k1 ..
+  k10, the planner's situation: it only gets the current frame) and with the 1 or 2 real states before it as well
+  (k1_real2 .. k10_real3, like val/rollout_k*_real2/3 in training). The difference is what real history adds.
   After 1, 3, 5 and 10 steps we compare the prediction with the real state at that point (prediction_error). The
-  baseline is "the first state never changed" (copy_error), and error_ratio = prediction_error / copy_error. All step
-  counts use the same windows, so they can be compared directly: a ratio that grows with the steps means the errors
-  pile up.
+  baseline is "the start state never changed" (copy_error), and error_ratio = prediction_error / copy_error. All step
+  counts and start lengths use the same windows and targets, so they can be compared directly: a ratio that grows with
+  the steps means the errors pile up.
   """
-  evaluation_set, frames = context.sets[split], context.latents[split]["window"]  # per window the latents of its 11 states
+  evaluation_set, frames = context.sets[split], context.latents[split]["window"]  # per window the latents of its 13 states
   if not len(frames):
     return []
   device, encoded_actions = context.parameters.device, encode_actions(context)
-  actions = evaluation_set.arrays["window_action"].astype(int)  # per window the 10 recorded actions
-  with torch.no_grad():
-    predicted = torch.cat([context.model.predict_rollout(torch.as_tensor(frames[start:start + BATCH_SIZE, :1], device=device), encoded_actions[torch.as_tensor(actions[start:start + BATCH_SIZE] - 1, device=device)],
-                                                         context.info["history_size"]).float().cpu() for start in range(0, len(frames), BATCH_SIZE)]).numpy()  # per window the predictions for steps 1 .. 10
+  actions = evaluation_set.arrays["window_action"].astype(int)  # per window the 12 recorded actions
+  start, horizon = context.parameters.history - 1, ROLLOUT_HORIZONS[-1]  # the rollout starts at frame `start`, the frames before it are its real history
   levels, rows = evaluation_set.windows.level.to_numpy(), []
-  for k in ROLLOUT_HORIZONS:
-    prediction_error = ((predicted[:, k - 1] - frames[:, k]) ** 2).mean(axis=1)
-    copy_error = ((frames[:, 0] - frames[:, k]) ** 2).mean(axis=1)
-    rows += metric_rows_per_level("multi_step_rollout", "prediction_error", split, prediction_error, levels, f"k{k}")
-    rows += metric_rows_per_level("multi_step_rollout", "copy_error", split, copy_error, levels, f"k{k}")
-    rows += metric_rows_per_level("multi_step_rollout", "error_ratio", split, prediction_error, levels, f"k{k}", denominator=copy_error)
+  for real in range(1, min(context.parameters.history, context.info["history_size"]) + 1):  # real frames the rollout starts from
+    predicted = []
+    with torch.no_grad():
+      for first in range(0, len(frames), BATCH_SIZE):
+        real_frames = torch.as_tensor(frames[first:first + BATCH_SIZE, start - real + 1:start + 1], device=device)  # the start state and the real ones before it
+        taken = encoded_actions[torch.as_tensor(actions[first:first + BATCH_SIZE, start - real + 1:start + horizon] - 1, device=device)]  # the actions taken in them, then the next ones
+        predicted.append(context.model.predict_rollout(real_frames, taken, context.info["history_size"]).float().cpu())
+    predicted = torch.cat(predicted).numpy()  # per window the predictions for steps 1 .. 10
+    for k in ROLLOUT_HORIZONS:
+      subset = f"k{k}" + (f"_real{real}" if real > 1 else "")
+      prediction_error = ((predicted[:, k - 1] - frames[:, start + k]) ** 2).mean(axis=1)
+      copy_error = ((frames[:, start] - frames[:, start + k]) ** 2).mean(axis=1)
+      rows += metric_rows_per_level("multi_step_rollout", "prediction_error", split, prediction_error, levels, subset)
+      if real == 1:  # the same for every start length
+        rows += metric_rows_per_level("multi_step_rollout", "copy_error", split, copy_error, levels, subset)
+      rows += metric_rows_per_level("multi_step_rollout", "error_ratio", split, prediction_error, levels, subset, denominator=copy_error)
   return rows
 
 
@@ -1242,7 +1327,7 @@ def split_gaps(metrics: list):
     return []
   table = pd.DataFrame(metrics)
   table = table[(table.level == "all") & table.split.isin(SPLITS)]
-  table.loc[(table.experiment == "state_probes") & (table.subset == "zero_shot"), "subset"] = "probe"  # on unseen levels, the trained probe's result is its zero-shot result
+  table.loc[table.experiment.isin(["state_probes", "action_decoding"]) & (table.subset == "zero_shot"), "subset"] = "probe"  # on unseen levels, the trained probe's result is its zero-shot result
   pivot = table.pivot_table(index=["experiment", "metric", "subset"], columns="split", values=["value", "n"], aggfunc="first")
   rows = []
   for (experiment, name, subset), entry in pivot.iterrows():
@@ -1308,6 +1393,7 @@ def main() -> None:
     if compare_to is not None:
       metrics += checkpoint_similarity(context, split)
   metrics += state_probes(context)  # trained once on seen_train, tested on every split
+  metrics += action_decoding(context)  # the same
   map_metrics, maps = latent_maps(context)
   metrics += map_metrics
   metrics += split_gaps(metrics)  # the differences between the splits of all metrics above
