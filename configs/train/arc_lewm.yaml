@@ -36,13 +36,13 @@ sampling:
 
 extensions:  # defaults = plain LeWM (one_step_loss only); switch on the additions from later papers (their settings are under loss.*)
   one_step_loss: true  # LeWM's own teacher-forced one-step prediction loss; can run alone, with rollout_loss, or be replaced by it (at least one of the two)
-  rollout_loss: false  # Semigroup-JEPA (arXiv:2609.10464): imagine wm.num_preds steps from one real frame (false in all runs up to ls20_multi-no-l3_delta_warm300k; later runs used it instead of one_step_loss)
+  rollout_loss: false  # Semigroup-JEPA (arXiv:2609.10464): imagine wm.num_preds steps from 1, 2, ..., loss.rollout.context real frames (false in all runs up to ls20_multi-no-l3_delta_warm300k; later runs used it instead of one_step_loss)
   tc_sigreg: false  # TC-SIGReg (arXiv:2607.26924): SIGReg on the latents minus their window mean instead of the latents (false in all runs up to ls20_multi-no-l3_220k_succ0.1_0918-1951)
   delta_jepa: false  # Delta-JEPA (arXiv:2606.31232): an action decoder names the action from z_t+1 - z_t (adds model.action_decoder and loss.action)
 
 wm:
   history_size: 3  # latents the predictor attends to; LeWM's one-step loss uses windows of history_size + 1 = 4 frames
-  num_preds: 5  # K, only with extensions.rollout_loss: steps imagined from one real frame; windows of 1 + K = 6 frames
+  num_preds: 5  # K, only with extensions.rollout_loss: steps imagined from the real frames; windows of loss.rollout.context + K = 8 frames
 
 trainer:
   max_epochs: 100
@@ -80,6 +80,9 @@ loss:
   rollout:  # extensions.rollout_loss
     weight: 1.0
     discount: 0.95  # gamma: step k of the rollout loss is weighted by gamma^(k-1) (Semigroup-JEPA's best value)
+    context: ${wm.history_size}  # most real frames a rollout starts from. Every batch rolls out from 1, 2, ..., context real frames to the same K targets and averages the
+                                 # losses, like LeWM's one-step loss trains every context length at once: a plan starts from one real frame (the planner only gets the
+                                 # current one), longer real histories teach the predictor to use them. Runs before 24.10.26 have no key: they started from 1 real frame
   action:  # extensions.delta_jepa
     weight: 0.5  # lambda of Delta-JEPA's action loss. Chosen so the action term (~0.5 * 0.6 at convergence) is the same order as the SIGReg term (0.09 * ~1.7);
                 # the paper's 10-50 is for an MSE on continuous actions, ours is a cross-entropy that starts near ln 7 = 1.95

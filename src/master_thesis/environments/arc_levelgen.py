@@ -75,11 +75,12 @@ def source_game_file(game_id=SOURCE_GAME):
   return arc_environments_dir() / name / version / f"{name}.py"
 
 
-def spec_from_level(level):
+def spec_from_level(level, number):
   """
   Read a real Level into a LevelSpec (used to validate the solver on the real levels).
 
-  GETS:    level -- an arcengine Level from the game file.
+  GETS:    level -- an arcengine Level from the game file; number -- its 1-based level number (level 1 has a
+           tutorial rule, see LevelSpec.first_level).
   DOES:    maps every sprite to its cell. Walls use the cell their origin falls into, exactly as the engine's
            movement check does (one real wall, in level 2, is off the grid). Refills sit 1 px inside their cell,
            platforms 1 px behind it (in their push direction).
@@ -111,6 +112,7 @@ def spec_from_level(level):
     start_rotation=ROTATIONS.index(level.get_data("StartRotation")),
     step_counter=level.get_data("StepCounter"),
     steps_decrement=2 if decrement is None else decrement,
+    first_level=number == 1,
   )
 
 
@@ -379,7 +381,7 @@ def check_real_levels(levels=(1, 2, 3, 4)):
   env = make_game(SOURCE_GAME)
   all_ok = True
   for number in levels:
-    spec = spec_from_level(module.levels[number - 1])
+    spec = spec_from_level(module.levels[number - 1], number)
     solution = solve(spec)
     completed = solution is not None and certify(env, number, solution)[0]
     all_ok &= completed

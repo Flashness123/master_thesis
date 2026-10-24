@@ -10,7 +10,7 @@
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ one_step_prediction                                 │ state + its recorded next state                      │ states (next_grid) │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
-│ counterfactual_actions                              │ state + the 4 move outcomes                          │ states             │
+│ counterfactual_actions                              │ state + the 2 states before it + the 4 move outcomes │ states (history)   │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ action_ranking                                      │ state + 4 outcomes + the state 5 steps later         │ states (goal_grid) │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
@@ -122,6 +122,7 @@ EXPERIMENT_PARAMETERS = {"full": {
   "states_per_level": 200,      # picked at random from all states of the level's episodes
   "windows_per_level": 50,      # rollout windows: 11 recorded states in a row
   "goal_ahead": 5,              # action_ranking: the goal is the recorded state this many steps later
+  "history": 3,                 # counterfactual_actions: real frames it predicts from (the state and the ones before it; fewer at an episode start, never more than the model's history_size)
   # state_probes and state_aliasing
   "probe_steps": 2000,          # training steps (batches of 256) on seen_train
   "probe_adapt_steps": 300,     # fine-tuning steps on the unseen adapt half
@@ -304,7 +305,7 @@ def load_checkpoint(checkpoint: str, device: str):
   rollout_loss = bool(OmegaConf.select(config, "extensions.rollout_loss", default=False))  # older runs have no extensions block: they used the one-step loss
   info = {"id": run if weights == "weights.pt" else f"{run}__{Path(weights).with_suffix('').as_posix().replace('/', '_')}", "run": run, "weights": weights,
           "img_size": int(config.img_size), "history_size": history_size,
-          "dataset": str(config.data.dataset), "frameskip": int(config.data.frameskip), "window": 1 + int(config.wm.num_preds) if rollout_loss else history_size + 1,  # as training/lewm.py build_dataset
+          "dataset": str(config.data.dataset), "frameskip": int(config.data.frameskip), "window": int(OmegaConf.select(config, "loss.rollout.context", default=1)) + int(config.wm.num_preds) if rollout_loss else history_size + 1,  # as training/lewm.py build_dataset; runs before 24.10.26 started their rollout from 1 real frame
           "seed": int(config.seed), "train_split": float(config.train_split), "val_split": float(config.val_split),
           "started": datetime.fromtimestamp((folder / "train_config.yaml").stat().st_mtime).isoformat(timespec="seconds")}
   return model, info
@@ -449,11 +450,13 @@ class EvaluationSet:
   We build three of these: seen_train, seen_val and unseen. with usually 200 states and 50 windows of len 11. Every metric is computed on each one separately, for comparing memorization and generalization.
     counts    how many episodes were candidates, replayed and dropped, and how many states and windows remain
     dropped   why episodes were dropped: reason -> number of episodes
-    states    one row per picked state: where it comes from (dataset, episode, step, level, part), the recorded action, has_next / has_goal, next_change, and the game state as label_player_x, label_energy
+    states    one row per picked state: where it comes from (dataset, episode, step, level, part), the recorded action, has_next / has_goal, next_change, history_frames (real frames up to the state, at most history), and the game state as label_player_x, label_energy
     outcomes  one row per (state, move): what the move really did (dx, dy, life_lost, success, change)
     windows   one row per rollout window: where it starts
     arrays    the grids: grid, next_grid, goal_grid (the state goal_ahead steps later), outcome_grid (after each of
-              the 4 actions), window_grid (11 grids per window) and window_action (the 10 actions between them)
+              the 4 actions), history_grid (the history - 1 recorded grids before the state, oldest first; zeros before the
+              episode start) and history_action (the actions taken in them), window_grid (11 grids per window) and
+              window_action (the 10 actions between them)
   """
   split: str
   counts: dict
@@ -522,7 +525,7 @@ def build_evaluation_set(split: str, episodes, versions: dict, parameters) -> Ev
   dropped = pd.Series([episode["status"] for episode in replayed.values() if episode["status"] != "ok"], dtype=str).value_counts().to_dict()  # reason -> number of episodes
 
   # put the states of the episodes that replayed correctly together with their game state, action outcomes and grids
-  state_rows, outcome_rows, grid, next_grid, goal_grid, outcome_grid = [], [], [], [], [], []
+  state_rows, outcome_rows, grid, next_grid, goal_grid, outcome_grid, history_grid, history_action = [], [], [], [], [], [], [], []
   for (dataset, episode), steps in states.groupby(["dataset", "episode"], sort=True).step:
     if (dataset, episode) not in ok:
       continue
@@ -532,13 +535,16 @@ def build_evaluation_set(split: str, episodes, versions: dict, parameters) -> Ev
       has_next, has_goal = step + 1 < row.length, step + parameters.goal_ahead < row.length
       state = len(state_rows)
       state_rows.append({"state": state, "dataset": dataset, "episode": int(episode), "episode_idx": int(row.episode_idx), "step": int(step), "level": int(row.level), "part": row.part,
-                         "game_id": data["game_id"], "action": int(data["action"][step]), "has_next": has_next, "has_goal": has_goal,
+                         "game_id": data["game_id"], "action": int(data["action"][step]), "has_next": has_next, "has_goal": has_goal, "history_frames": min(int(step), parameters.history - 1) + 1,
                          "next_change": str(classify_change(data["grid"][step], data["grid"][step + 1])) if has_next else "", **{f"label_{key}": value for key, value in result["labels"][position].items()}})
       outcome_rows += [{"state": state, **outcome} for outcome in result["outcomes"][position * len(ACTIONS):(position + 1) * len(ACTIONS)]]
       grid.append(data["grid"][step])
       next_grid.append(data["grid"][step + 1] if has_next else np.zeros(4096, dtype=np.uint8))
       goal_grid.append(data["grid"][step + parameters.goal_ahead] if has_goal else np.zeros(4096, dtype=np.uint8))
       outcome_grid.append(result["outcome_grids"][position])
+      before = range(step - parameters.history + 1, step)  # the recorded steps before the state, oldest first (negative: before the episode start)
+      history_grid.append([data["grid"][earlier] if earlier >= 0 else np.zeros(4096, dtype=np.uint8) for earlier in before])
+      history_action.append([int(data["action"][earlier]) if earlier >= 0 else 0 for earlier in before])
   states = pd.DataFrame(state_rows)
   mismatched = states.label_level != states.level if len(states) else pd.Series(dtype=bool)  # the game plays another level than the recording says: should never happen
   if mismatched.any():
@@ -553,7 +559,8 @@ def build_evaluation_set(split: str, episodes, versions: dict, parameters) -> Ev
   counts = {"candidate_episodes": len(episodes), "replayed_episodes": len(replayed), "dropped_episodes": len(replayed) - len(ok), "levels": int(states.level.nunique()) if len(states) else 0,
             "states": len(states), "windows": len(windows)}
   arrays = {"grid": np.asarray(grid, np.uint8).reshape(-1, 4096), "next_grid": np.asarray(next_grid, np.uint8).reshape(-1, 4096), "goal_grid": np.asarray(goal_grid, np.uint8).reshape(-1, 4096),
-            "outcome_grid": np.asarray(outcome_grid, np.uint8).reshape(-1, len(ACTIONS), 4096), "window_grid": window_grid.astype(np.uint8), "window_action": window_action.astype(np.int16)}
+            "outcome_grid": np.asarray(outcome_grid, np.uint8).reshape(-1, len(ACTIONS), 4096), "window_grid": window_grid.astype(np.uint8), "window_action": window_action.astype(np.int16),
+            "history_grid": np.asarray(history_grid, np.uint8).reshape(len(states), parameters.history - 1, 4096), "history_action": np.asarray(history_action, np.int16).reshape(len(states), parameters.history - 1)}
   return EvaluationSet(split=split, counts=counts, dropped=dropped, states=states, outcomes=pd.DataFrame(outcome_rows), windows=windows, arrays=arrays)
 
 
@@ -565,11 +572,12 @@ def encode_evaluation_set(model, info: dict, evaluation_set: EvaluationSet, para
     - next: their recorded next states;
     - goal: their states 5 steps later (for action ranking);
     - outcome: the 4 grids after each move, per state;
+    - history: the recorded states before each state (for counterfactual_actions), NaN before the episode start;
     - window: the 11 frames of each rollout window.
   """
-  names = ("state", "next", "goal", "outcome", "window")
+  names = ("state", "next", "goal", "outcome", "history", "window")
   arrays = evaluation_set.arrays
-  parts = dict(zip(names, (arrays["grid"], arrays["next_grid"], arrays["goal_grid"], arrays["outcome_grid"], arrays["window_grid"])))
+  parts = dict(zip(names, (arrays["grid"], arrays["next_grid"], arrays["goal_grid"], arrays["outcome_grid"], arrays["history_grid"], arrays["window_grid"])))
   latents = encode_grids(model, info["img_size"], np.concatenate([part.reshape(-1, 4096) for part in parts.values()]), parameters.device)  # all at once, so a grid in several parts is encoded once
   encoded, start = {}, 0
   for name, part in parts.items():
@@ -579,6 +587,7 @@ def encode_evaluation_set(model, info: dict, evaluation_set: EvaluationSet, para
   if len(evaluation_set.states):
     encoded["next"][~evaluation_set.states.has_next.to_numpy()] = np.nan
     encoded["goal"][~evaluation_set.states.has_goal.to_numpy()] = np.nan
+    encoded["history"][np.arange(parameters.history - 1)[None] < (parameters.history - evaluation_set.states.history_frames.to_numpy())[:, None]] = np.nan  # the zero grids before the episode start
   return encoded
 
 
@@ -630,11 +639,14 @@ def encode_actions(context: AnalysisContext):
 
 @torch.no_grad()
 def predict_next_latent(context: AnalysisContext, latents, actions):
-  """Predict the next latent from one real latent and one action id (1-4), like the planner's first step"""
+  """
+  Predict the latent after the last action from real latents [N, frames, 192] and the action ids (1-4) taken in them [N, frames].
+  With one frame this is the planner's first step; with more, the predictor also sees the real history before it.
+  """
   device, encoded_actions = context.parameters.device, encode_actions(context)
-  predictions = [context.model.predict(torch.as_tensor(latents[start:start + BATCH_SIZE], device=device)[:, None], encoded_actions[torch.as_tensor(np.asarray(actions[start:start + BATCH_SIZE]) - 1, device=device)][:, None])[:, -1].float().cpu()
+  predictions = [context.model.predict(torch.as_tensor(latents[start:start + BATCH_SIZE], device=device), encoded_actions[torch.as_tensor(np.asarray(actions[start:start + BATCH_SIZE], dtype=np.int64) - 1, device=device)])[:, -1].float().cpu()
                  for start in range(0, len(latents), BATCH_SIZE)]
-  return torch.cat(predictions).numpy() if predictions else np.zeros((0, latents.shape[1]), np.float32)
+  return torch.cat(predictions).numpy() if predictions else np.zeros((0, latents.shape[-1]), np.float32)
 
 
 def train_probe(inputs, targets, outputs: int, steps: int, seed: int, device: str, probe=None, class_weight=None):
@@ -958,7 +970,9 @@ def one_step_prediction(context: AnalysisContext, split: str):
 
   Data: the split's picked states that have a recorded next state, with the action that was taken there.
   How: encode the state, let the predictor predict the next latent from this one frame and the action (as the
-  planner's first step does), and compare it with the encoded real next state: the squared difference, averaged over
+  planner's first step does: only one real frame, no history), and compare it with the encoded real next state.
+  counterfactual_actions predicts the same with up to 3 real frames, so for the recorded action the two together show
+  what real history adds. prediction_error is the squared difference, averaged over
   the 192 latent numbers (prediction_error). As a baseline we pretend nothing changes and compare the current latent
   with the real next one (copy_error); this also shows how much one step changes the latent at all.
   error_ratio = prediction_error / copy_error can be compared between models, whose latents have different scales:
@@ -972,7 +986,7 @@ def one_step_prediction(context: AnalysisContext, split: str):
   if not selected.any():
     return []
   current, following = latents["state"][selected], latents["next"][selected]
-  predicted = predict_next_latent(context, current, states.action.to_numpy()[selected])
+  predicted = predict_next_latent(context, current[:, None], states.action.to_numpy()[selected][:, None])
   prediction_error = ((predicted - following) ** 2).mean(axis=1)  # per step: squared difference, averaged over the 192 numbers
   copy_error = ((current - following) ** 2).mean(axis=1)
   levels, change = states.level.to_numpy()[selected], states.next_change.to_numpy()[selected]
@@ -997,9 +1011,13 @@ def counterfactual_actions(context: AnalysisContext, split: str):
   The recordings only show one action per state, so they cannot test this. During the replay all 4 actions were played
   from the same real state, so here we know the real result of each one.
 
-  Data: the split's picked states and the real outcomes of all 4 actions.
+  Data: the split's picked states, the recorded states and actions before them, and the real outcomes of all 4 actions.
+  History: the predictor gets the state and the up to 2 recorded states before it (the history parameter; fewer at an
+  episode start, never more than the model's history_size), with the actions really taken there; only the last action
+  is varied. This is the most real context the predictor can use, as in the one-step training loss, so it shows what the
+  predictor knows. (one_step_prediction uses one frame; for the recorded action the difference is what history adds.)
   How, for every state:
-    - each action: predict its outcome from the one real frame and compare it with the encoded real outcome
+    - each action: predict its outcome and compare it with the encoded real outcome
       (prediction_error), and with "nothing changes" (giving error_ratio, as in one_step_prediction). Reported per
       action (up, down, left, right) and per kind of change the action really caused (mechanics, energy_only, none).
     - each pair of actions (6 per state): the predicted difference between their two outcomes should match the real
@@ -1016,7 +1034,14 @@ def counterfactual_actions(context: AnalysisContext, split: str):
   if not count:
     return []
   current, outcomes = latents["state"], latents["outcome"]  # outcomes: per state the latents after each of the 4 actions
-  predicted = predict_next_latent(context, np.repeat(current, len(ACTIONS), axis=0), np.tile(ACTIONS, count)).reshape(outcomes.shape)
+  sequence = np.repeat(np.concatenate([latents["history"], current[:, None]], axis=1), len(ACTIONS), axis=0)  # per (state, action) its real latents, oldest first  [N * 4, history, 192]
+  taken = np.concatenate([np.repeat(evaluation_set.arrays["history_action"], len(ACTIONS), axis=0), np.tile(ACTIONS, count)[:, None]], axis=1)  # the recorded actions, then the tried one  [N * 4, history]
+  frames = np.repeat(np.minimum(evaluation_set.states.history_frames.to_numpy(), context.info["history_size"]), len(ACTIONS))  # real frames per (state, action)
+  predicted = np.zeros((len(sequence), current.shape[1]), np.float32)
+  for length in np.unique(frames):  # predicted together in groups with the same number of real frames
+    rows = frames == length
+    predicted[rows] = predict_next_latent(context, sequence[rows][:, -length:], taken[rows][:, -length:])
+  predicted = predicted.reshape(outcomes.shape)
   prediction_error = ((predicted - outcomes) ** 2).mean(axis=-1)  # per state and action
   copy_error = ((current[:, None] - outcomes) ** 2).mean(axis=-1)
   levels = evaluation_set.states.level.to_numpy()
@@ -1057,7 +1082,8 @@ def multi_step_rollout(context: AnalysisContext, split: str):
 
   Data: the split's rollout windows: 11 recorded states in a row and the 10 actions between them.
   How: give the model only the first real state and the actions. It predicts one step at a time and always uses its
-  own predictions as the history for the next step (it looks at its last history_size latents, like the planner).
+  own predictions as the history for the next step (it looks at its last history_size latents, like the planner): its
+  history is gathered by itself, it never sees a second real frame.
   After 1, 3, 5 and 10 steps we compare the prediction with the real state at that point (prediction_error). The
   baseline is "the first state never changed" (copy_error), and error_ratio = prediction_error / copy_error. All step
   counts use the same windows, so they can be compared directly: a ratio that grows with the steps means the errors
@@ -1168,7 +1194,8 @@ def action_ranking(context: AnalysisContext, split: str):
   """
   Does the predictor rank the 4 actions by "which brings me closer to the goal" like the real game does?
 
-  This is what the planner relies on, but it is much cheaper to measure than planning itself.
+  This is what the planner relies on, but it is much cheaper to measure than planning itself. So it predicts like the
+  planner: from one real frame, without history (the planner only gets the current frame).
   Data: the split's picked states that have a recorded state 5 (goal_ahead) steps later in their episode; that later
   state is the goal.
   How: for every action, the distance to the goal's latent, once from the predicted outcome and once from the real
@@ -1183,7 +1210,7 @@ def action_ranking(context: AnalysisContext, split: str):
     return []
   count = int(selected.sum())
   goals = latents["goal"][selected][:, None]
-  predicted = predict_next_latent(context, np.repeat(latents["state"][selected], len(ACTIONS), axis=0), np.tile(ACTIONS, count)).reshape(count, len(ACTIONS), -1)
+  predicted = predict_next_latent(context, np.repeat(latents["state"][selected], len(ACTIONS), axis=0)[:, None], np.tile(ACTIONS, count)[:, None]).reshape(count, len(ACTIONS), -1)
   predicted_distance, real_distance = ((predicted - goals) ** 2).sum(axis=-1), ((latents["outcome"][selected] - goals) ** 2).sum(axis=-1)  # per state and action: squared distance to the goal
 
   rank = lambda distance: (distance[:, None, :] < distance[:, :, None]).sum(axis=-1) + ((distance[:, None, :] == distance[:, :, None]).sum(axis=-1) + 1) / 2  # rank 1-4 per state; equal distances share their rank (two blocked moves: 1, 2.5, 2.5, 4)

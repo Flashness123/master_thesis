@@ -51,7 +51,7 @@ from master_thesis.environments.arc_solver import Goal, LevelSpec, reachable, so
 from master_thesis.paths import synthetic_dir, timestamp
 from master_thesis.policies.arc_solver_walk import SolverWalk
 
-MIN_MOVES_LEFT = 5  # a run starts only where at least 5 moves of energy are left: training windows have 6 states (1 + wm.num_preds), so a run that ends sooner yields none
+MIN_MOVES_LEFT = 5  # a run starts only where at least 5 moves of energy are left: training windows had 6 states (1 + wm.num_preds) when this was set (now 8 with the rollout loss), so a run that ends sooner yields none
 
 
 def lives(frame):
@@ -132,7 +132,7 @@ def collect_synthetic(game_id, max_runs, max_steps, seed, levels=None, name=None
   env = make_game(game_id)  # one game for all recordings: making one per run would copy all levels of the game file every time
   for level in levels:
     if level <= NUM_REAL_LEVELS:
-      spec = spec_from_level(real_levels[level - 1])  # raises for levels 5-7 (moving changers)
+      spec = spec_from_level(real_levels[level - 1], level)  # raises for levels 5-7 (moving changers)
       solution = solve(spec)  # record_solution below checks it in the real engine, as certify does for the synthetic levels
     else:
       spec, solution = synthetic_levels[level]

@@ -53,6 +53,9 @@ class LevelSpec:
            start_shape / start_color / start_rotation -- the symbol at the start (indices).
            step_counter     -- energy at the start and after a refill (StepCounter, 42 in all real levels).
            steps_decrement  -- energy per move (StepsDecrement; the game uses 2 when a level does not set it).
+           first_level      -- the real level 1 (the tutorial): there a changer that makes the symbol fit an
+                               unreached goal costs no energy, because the game shows a hint instead
+                               (Ls20.vqfjzzkhid only does this on the first level).
   """
   walls: set[tuple[int, int]]
   start: tuple[int, int]
@@ -67,6 +70,7 @@ class LevelSpec:
   start_rotation: int = 0
   step_counter: int = 42
   steps_decrement: int = 2
+  first_level: bool = False
 
 
 def _in_grid(cell):
@@ -129,7 +133,9 @@ def transition(spec, state, action):
     return (target, shape, color, rotation, energy, refills_taken, goals_reached)
 
   shape, color, rotation, energy, refills_taken, refilled = _apply_objects(spec, target, shape, color, rotation, energy, refills_taken)
-  if not refilled:
+  hint = spec.first_level and target in spec.rotators | spec.colorers | spec.shapers and any(  # level 1 only: the game shows a hint and ends the move before charging energy
+    (goal.shape, goal.color, goal.rotation) == (shape, color, rotation) and not goals_reached & (1 << index) for index, goal in enumerate(spec.goals))
+  if not refilled and not hint:
     energy -= spec.steps_decrement
     if energy < 0:
       return None  # out of energy: the engine takes a life and resets; a clean solution never does that

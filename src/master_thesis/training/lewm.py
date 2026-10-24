@@ -220,14 +220,14 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length wind
   RETURNS: a stable-worldmodel dataset whose __getitem__ yields one window as
            {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
            {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
-           (T = 4 for LeWM's one-step loss, 6 with the rollout loss.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
+           (T = 4 for LeWM's one-step loss, 8 with the rollout loss.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
   """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
     raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
 
   # Frames per sample. LeWM's one-step loss: history_size + 1 = 4 (3 context frames + 1 more target).
-  # Rollout loss (Semigroup-JEPA): 1 + num_preds = 6 (one real frame + K imagined steps); with both on, the one-step loss uses the first 4.
-  window = 1 + cfg.wm.num_preds if cfg.extensions.rollout_loss else cfg.wm.history_size + 1
+  # Rollout loss (Semigroup-JEPA): loss.rollout.context + num_preds = 8 (up to 3 real frames + K imagined steps); with both on, the one-step loss uses the first 4.
+  window = cfg.loss.rollout.context + cfg.wm.num_preds if cfg.extensions.rollout_loss else cfg.wm.history_size + 1
   dataset_name = cfg.data.name
   dataset = swm.data.load_dataset(dataset_name, transform=None,  # The windowing call (stable-worldmodel, not our code). num_steps=4 means every sample is 4 consecutive states of ONE episode; consecutive windows overlap (slide by 1). This is why a 41-state episode yields 38 windows. frameskip=1 -> no frames skipped (one ARC step = one transition).
                                   frameskip=cfg.data.frameskip,
@@ -438,7 +438,7 @@ def lewm_forward(self, batch, stage, cfg, ):
                     self.sigreg (the SIGReg regularizer), and self.training (train vs eval flag).
            batch -- one DataLoader batch, already transformed:
                     {"pixels":[B,T,3,224,224], "action":[B,T,9], "grid":[B,T,4096]}; T = 4 for LeWM,
-                    1 + wm.num_preds with the rollout loss. Action a_t is the action taken IN state s_t.
+                    loss.rollout.context + wm.num_preds with the rollout loss. Action a_t is the action taken IN state s_t.
            stage -- "fit"/"validate" (unused here, branch on self.training instead).
            cfg   -- resolved config; uses extensions.*, wm.history_size, loss.*.
   DOES:    JEPA.encode -> per-frame latents + action latents, then the loss terms:
@@ -464,14 +464,19 @@ def lewm_forward(self, batch, stage, cfg, ):
     predictions = self.model.predict(embeddings[:, :history_size], action_embeddings[:, :history_size])  # ẑ1..ẑ3  [B, 3, 192]
     terms["pred_loss"] = (cfg.loss.one_step.weight, (predictions - embeddings[:, 1:history_size + 1]).pow(2).mean())
   if extensions.rollout_loss:
-    # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from the ONE real z0, feeding predictions back,
-    # exactly as the planner does; the error at every step flows back into predictor AND encoder, so the encoder has to keep what the predictor needs to carry forward.
-    # (The paper starts from H real frames; we start from one because our planner does.)
-    num_preds = embeddings.size(1) - 1  # K = wm.num_preds: the window is 1 real frame + K frames
-    predictions = self.model.predict_rollout(embeddings[:, :1], action_embeddings[:, :num_preds], history_size)  # ẑ1..ẑK  [B, K, 192]
-    step_errors = (predictions - embeddings[:, 1:]).pow(2).mean(dim=(0, 2))  # MSE of each step [K]; targets NOT detached, as before and as in the paper
-    weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=step_errors.dtype)  # gamma^(k-1): later, more uncertain steps count a bit less
-    terms["rollout_pred_loss"] = (cfg.loss.rollout.weight, (weights / weights.sum() * step_errors).sum())  # normalized, so the loss keeps the scale of a single-step MSE
+    # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from real frames, feeding predictions back as the planner does; the predictor
+    # always sees the last history_size latents, so after a few steps only its own predictions. The error at every step flows back into predictor AND encoder,
+    # so the encoder has to keep what the predictor needs to carry forward.
+    # The paper starts from H real frames. We start from 1, 2, ..., context real frames (the last ones before the targets) and average: the planner and every episode
+    # start with a single real frame, and longer real histories teach the predictor to use them, like LeWM's one-step loss trains every context length at once.
+    context, num_preds = cfg.loss.rollout.context, cfg.wm.num_preds  # the window: z0..z(context-1) real context, then K targets
+    targets = embeddings[:, context:]  # z(context)..z(context+K-1), the same K targets for every start length  [B, K, 192]
+    weights = cfg.loss.rollout.discount ** torch.arange(num_preds, device=embeddings.device, dtype=torch.float32)  # gamma^(k-1): later, more uncertain steps count a bit less
+    step_errors = {}  # real start frames -> MSE of each step [K]
+    for real in range(1, context + 1):
+      predictions = self.model.predict_rollout(embeddings[:, context - real:context], action_embeddings[:, context - real:context + num_preds - 1], history_size)  # [B, K, 192]
+      step_errors[real] = (predictions - targets).pow(2).mean(dim=(0, 2))  # targets NOT detached, as before and as in the paper
+    terms["rollout_pred_loss"] = (cfg.loss.rollout.weight, sum((weights / weights.sum() * errors).sum() for errors in step_errors.values()) / context)  # normalized, so the loss keeps the scale of a single-step MSE
 
   # --- SIGReg: anti-collapse ---
   sigreg_input = embeddings  # [B, T, D]; LeWM: SIGReg on the embeddings themselves
@@ -502,10 +507,13 @@ def lewm_forward(self, batch, stage, cfg, ):
     context_embeddings, context_actions = embeddings[:, :history_size], action_embeddings[:, :history_size]
     teacher_forced = self.model.predict(context_embeddings, context_actions)
     metrics = world_model_metrics(model=self.model, embeddings=embeddings[:, :history_size + 1], context_embeddings=context_embeddings, context_actions=context_actions, targets=embeddings[:, 1:history_size + 1], predictions=teacher_forced, )
-    metrics["pred_loss"] = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean()  # one-step teacher-forced MSE (without the rollout loss this is the training term itself)
+    position_errors = (teacher_forced - embeddings[:, 1:history_size + 1]).pow(2).mean(dim=(0, 2))  # [history_size]: position t predicts from t + 1 real frames (the predictor is causal)
+    metrics["pred_loss"] = position_errors.mean()  # one-step teacher-forced MSE (without the rollout loss this is the training term itself)
+    metrics.update({f"pred_loss_real{t + 1}": error for t, error in enumerate(position_errors)})  # the same per number of real frames: does real history help? (every model, with or without the rollout loss)
     if extensions.rollout_loss:
-      stay = (embeddings[:, 1:] - embeddings[:, :1]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays z0"
-      metrics.update({f"rollout_k{k + 1}": step_errors[k] / stay[k] for k in range(len(step_errors))})  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
+      stay = (targets - embeddings[:, context - 1:context]).pow(2).mean(dim=(0, 2))  # baseline per step: "the state stays the last real frame"
+      for real, errors in step_errors.items():  # rollout error after k steps relative to that baseline (0 = perfect, 1 = no better than standing still)
+        metrics.update({f"rollout_k{k + 1}" + (f"_real{real}" if real > 1 else ""): errors[k] / stay[k] for k in range(num_preds)})  # rollout_k*: from 1 real frame, as the planner and all earlier runs
     if extensions.delta_jepa:
       valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
       metrics["action_accuracy"] = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
