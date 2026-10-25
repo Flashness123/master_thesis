@@ -1,0 +1,621 @@
+<!doctype html>
+<!-- The page of lewm_dashboard.py: it replaces __LEWM_DATA__ with the results and __PLOTLY_JS__ with the Plotly library. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeWM analysis</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11, 11, 11, 0.10); --wash: rgba(42, 120, 214, 0.08);
+  --ck-a: #2a78d6; --ck-b: #eb6834;                       /* checkpoint A and B (categorical slots 1, 2) */
+  --split-1: #2a78d6; --split-2: #eb6834; --split-3: #1baf7a;  /* the splits in the latent maps (slots 1-3, all pairs pass) */
+  --ord-1: #86b6ef; --ord-2: #2a78d6; --ord-3: #104281;     /* 1, 2, 3 real frames (ordinal blue ramp) */
+  --rest: #c3c2b7;                                          /* de-emphasized points */
+  --seq-0: #cde2fb; --seq-1: #6da7ec; --seq-2: #256abf; --seq-3: #0d366b;  /* sequential blue, low -> high */
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --wash: rgba(57, 135, 229, 0.12);
+    --ck-a: #3987e5; --ck-b: #d95926;
+    --split-1: #3987e5; --split-2: #d95926; --split-3: #199e70;
+    --ord-1: #184f95; --ord-2: #3987e5; --ord-3: #9ec5f4;
+    --rest: #383835;
+    --seq-0: #104281; --seq-1: #256abf; --seq-2: #6da7ec; --seq-3: #cde2fb;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --wash: rgba(57, 135, 229, 0.12);
+  --ck-a: #3987e5; --ck-b: #d95926;
+  --split-1: #3987e5; --split-2: #d95926; --split-3: #199e70;
+  --ord-1: #184f95; --ord-2: #3987e5; --ord-3: #9ec5f4;
+  --rest: #383835;
+  --seq-0: #104281; --seq-1: #256abf; --seq-2: #6da7ec; --seq-3: #cde2fb;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header.top { position: sticky; top: 0; z-index: 5; background: var(--page); border-bottom: 1px solid var(--border); padding: 14px 24px 0; }
+.title-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+.muted { color: var(--muted); }
+.secondary { color: var(--ink-2); }
+.filters { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin: 12px 0 10px; }
+.filters label { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+select, input[type="search"] { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; max-width: 420px; }
+select:focus-visible, input:focus-visible, button:focus-visible { outline: 2px solid var(--ck-a); outline-offset: 1px; }
+nav.tabs { display: flex; gap: 2px; overflow-x: auto; }
+nav.tabs button { font: inherit; font-size: 13px; color: var(--ink-2); background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; white-space: nowrap; }
+nav.tabs button:hover { color: var(--ink); background: var(--wash); }
+nav.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ck-a); font-weight: 600; }
+main { padding: 20px 24px 48px; max-width: 1480px; margin: 0 auto; }
+.question { color: var(--ink-2); margin: 0 0 16px; font-size: 15px; }
+.run { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+.card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card-head h3 { font-size: 15px; font-weight: 600; margin: 0; }
+.card-head .spacer { flex: 1; }
+.card .sub { color: var(--ink-2); margin: 4px 0 8px; font-size: 13px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--ink-2); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key-rect { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.key-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+button.ghost { font: inherit; font-size: 12px; color: var(--ink-2); background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+button.ghost[aria-pressed="true"] { background: var(--wash); color: var(--ink); }
+button.info { font: 600 11px/1 system-ui, sans-serif; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--axis); color: var(--ink-2); background: none; cursor: help; padding: 0; flex: none; }
+button.info:hover, button.info:focus-visible { color: var(--ink); border-color: var(--ink-2); }
+.popover { position: fixed; z-index: 20; max-width: 560px; background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18); font-size: 13px; }
+.popover strong { display: block; font-size: 14px; margin-bottom: 6px; }
+.popover .formula { overflow-x: auto; margin: 6px 0 10px; padding: 4px 0; }
+.popover .formula .katex-display { margin: 0.35em 0; }
+.popover .formula code { font-size: 12px; color: var(--ink-2); white-space: pre-wrap; }
+.popover p { margin: 0; color: var(--ink-2); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin-top: 10px; }
+.tile { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.tile .label { display: flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }
+.tile .note { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 28px; font-weight: 600; margin: 4px 0 2px; }
+.tile .value small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.tile .others { color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.tile .compare { font-size: 12px; margin-top: 4px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.chart { width: 100%; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--ink-2); font-weight: 600; white-space: nowrap; position: sticky; top: 0; background: var(--surface); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td .b { display: block; color: var(--muted); font-size: 11px; }
+td.better { font-weight: 600; }
+.table-box { overflow-x: auto; max-height: 520px; margin-top: 10px; }
+.empty { color: var(--muted); padding: 24px 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 4px 0 12px; }
+.controls label { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+.maps { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+.maps h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.splitdefs { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--ink-2); margin-top: 8px; }
+.splitdefs span { display: inline-flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="title-row"><h1>LeWM analysis</h1><span class="muted" id="subtitle"></span></div>
+  <div class="filters">
+    <label>Checkpoint <select id="ck-a"></select></label>
+    <label>Compare with <select id="ck-b"></select></label>
+    <label>Level <select id="level"></select></label>
+    <label>Theme <select id="theme"><option value="auto">Auto</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+  </div>
+  <nav class="tabs" id="tabs" role="tablist"></nav>
+</header>
+<main id="main"></main>
+<div id="popover" class="popover" role="tooltip" hidden></div>
+<script id="lewm-data" type="application/json">__LEWM_DATA__</script>
+<script>__PLOTLY_JS__</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("lewm-data").textContent);
+const C = Object.fromEntries(DATA.columns.map((name, index) => [name, index]));  // column -> position in a metric row
+const SPLITS = ["seen_train", "seen_val", "unseen"];
+const SPLIT_LABEL = {seen_train: "seen train", seen_val: "seen val", unseen: "unseen", all: "all states"};
+const CK_COLOR = ["--ck-a", "--ck-b"];
+const key = (...parts) => parts.join("|");
+for (const ck of DATA.checkpoints) {  // metric rows by experiment | metric | split | level | subset
+  ck.index = new Map(ck.metrics.map(row => [key(row[C.experiment], row[C.metric], row[C.split], row[C.level], row[C.subset]), row]));
+}
+const byTime = DATA.checkpoints.map((ck, index) => index).sort((a, b) => String(DATA.checkpoints[a].evaluated).localeCompare(String(DATA.checkpoints[b].evaluated)));
+const state = {a: byTime[byTime.length - 1], b: -1, level: "all", tab: "overview", map: "all", projection: "umap3", colour: "split"};
+
+// ---------- helpers ----------
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const el = (tag, attributes = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    if (name === "class") node.className = value; else if (name === "text") node.textContent = value; else node.setAttribute(name, value);
+  }
+  node.append(...children.filter(child => child !== null && child !== undefined));
+  return node;
+};
+const selected = () => [DATA.checkpoints[state.a], ...(state.b >= 0 && state.b !== state.a ? [DATA.checkpoints[state.b]] : [])];
+const shortName = ck => `${ck.checkpoint.run}${ck.checkpoint.weights === "weights.pt" ? "" : " · " + ck.checkpoint.weights.replace("checkpoints/", "").replace(".pt", "")}`;
+function metric(ck, experiment, name, split, subset = "all", level = state.level) {  // {value, n} or null
+  const row = ck.index.get(key(experiment, name, split, String(level), String(subset)));
+  return row && row[C.value] !== null ? {value: row[C.value], n: row[C.n]} : null;
+}
+function format(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "–";
+  if (Number.isInteger(value)) return value.toLocaleString("en-US");  // counts
+  const size = Math.abs(value);
+  return size >= 100 ? value.toFixed(0) : size >= 10 ? value.toFixed(1) : size >= 0.1 ? value.toFixed(2) : value.toPrecision(2);  // 2 decimals in the usual range, so a column lines up
+}
+function wrap(label) {  // two lines instead of rotated or overlapping axis labels: at ", " or at the space nearest the middle
+  if (label.includes(", ")) return label.replace(", ", "<br>");
+  if (label.length <= 12 || !label.includes(" ")) return label;
+  const spaces = [...label].map((char, index) => char === " " ? index : -1).filter(index => index >= 0);
+  const middle = spaces.reduce((best, index) => Math.abs(index - label.length / 2) < Math.abs(best - label.length / 2) ? index : best);
+  return `${label.slice(0, middle)}<br>${label.slice(middle + 1)}`;
+}
+// Bars at most 24px wide with a 2px gap between neighbours, whatever the panel width: widths and offsets in category units
+function barGeometry(groups, pixelsPerCategory, index) {
+  const width = Math.min(0.7 / groups, 24 / pixelsPerCategory), gap = 2 / pixelsPerCategory;
+  return {width, offset: -(groups * width + (groups - 1) * gap) / 2 + index * (width + gap)};
+}
+function signed(value) { return value === null ? "–" : (value > 0 ? "+" : value < 0 ? "−" : "±") + format(Math.abs(value)); }
+
+// ---------- info popover: what a metric measures, with the formula ----------
+const popover = document.getElementById("popover");
+let hideTimer = null;
+function infoFor(name) {
+  if (DATA.info[name]) return DATA.info[name];
+  const [experiment, ...rest] = name.split("/");
+  const metricName = rest.join("/");
+  if (experiment === "state_probes") return DATA.info[`state_probes/*/${metricName.split("/").pop()}`] || null;
+  if (experiment === "split_gaps") return DATA.info["split_gaps/*"];
+  if (metricName.startsWith("effect_mismatch")) return DATA.info["state_aliasing/effect_mismatch"];
+  return null;
+}
+function infoButton(name, extra) {
+  const entry = typeof name === "string" ? infoFor(name) : name;
+  if (!entry) return null;
+  const button = el("button", {class: "info", type: "button", "aria-label": `About: ${entry.title}`, text: "i"});
+  const show = () => {
+    clearTimeout(hideTimer);
+    popover.replaceChildren(el("strong", {text: entry.title}));
+    if (entry.latex) {
+      const formula = el("div", {class: "formula"});
+      const parts = entry.latex.split(/,?\s*\\qquad|,\s*\\quad/);  // one line per part of a formula ("a = ...,\quad b = ..."), so it fits the popover
+      if (window.katex) formula.innerHTML = parts.map(part => window.katex.renderToString(part, {displayMode: true, throwOnError: false})).join("");  // our own formulas
+      else formula.append(el("code", {text: entry.latex}));
+      popover.append(formula);
+    }
+    popover.append(el("p", {text: entry.text + (extra ? " " + extra : "")}));
+    popover.hidden = false;
+    const box = button.getBoundingClientRect(), width = popover.offsetWidth, height = popover.offsetHeight;
+    popover.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - width - 8))}px`;
+    popover.style.top = `${box.bottom + 8 + height < window.innerHeight ? box.bottom + 8 : Math.max(8, box.top - height - 8)}px`;
+  };
+  const hide = () => { hideTimer = setTimeout(() => { popover.hidden = true; }, 120); };
+  button.addEventListener("mouseenter", show); button.addEventListener("focus", show);
+  button.addEventListener("mouseleave", hide); button.addEventListener("blur", hide);
+  return button;
+}
+popover.addEventListener("mouseenter", () => clearTimeout(hideTimer));
+popover.addEventListener("mouseleave", () => { popover.hidden = true; });
+
+// ---------- card: title, info, legend, chart and its table view ----------
+function card(title, info, subtitle, legendItems) {
+  const body = el("div", {class: "chart"}), tableBox = el("div", {class: "table-box", hidden: ""});
+  const toggle = el("button", {class: "ghost", type: "button", "aria-pressed": "false", text: "Table"});
+  const legend = legendItems && legendItems.length ? el("div", {class: "legend"}, ...legendItems.map(([label, colour, shape]) =>
+    el("span", {}, el("i", {class: shape === "line" ? "key-line" : "key-rect", style: `background:${colour}`}), document.createTextNode(label)))) : null;
+  const node = el("section", {class: "card"},
+    el("div", {class: "card-head"}, el("h3", {text: title}), info ? infoButton(info) : null, el("span", {class: "spacer"}), legend, toggle),
+    subtitle ? el("p", {class: "sub", text: subtitle}) : null, body, tableBox);
+  let rows = [], headers = [];
+  toggle.addEventListener("click", () => {
+    const open = toggle.getAttribute("aria-pressed") !== "true";
+    toggle.setAttribute("aria-pressed", String(open));
+    tableBox.hidden = !open;
+    if (open) tableBox.replaceChildren(table(headers, rows));
+  });
+  return {node, body, setTable: (newHeaders, newRows) => { headers = newHeaders; rows = newRows; }};
+}
+function table(headers, rows) {
+  return el("table", {}, el("thead", {}, el("tr", {}, ...headers.map(([label, numeric]) => el("th", {class: numeric ? "num" : "", text: label})))),
+    el("tbody", {}, ...rows.map(row => el("tr", {}, ...row.map((value, index) => el("td", {class: headers[index][1] ? "num" : "", text: typeof value === "number" ? format(value) : value ?? "–"}))))));
+}
+const checkpointLegend = () => {  // two checkpoints of one run differ only in their weights: name only those
+  const cks = selected(), sameRun = cks.length > 1 && cks[0].checkpoint.run === cks[1].checkpoint.run;
+  return cks.length > 1 ? cks.map((ck, index) => [`${"AB"[index]}: ${sameRun ? ck.checkpoint.weights.replace("checkpoints/", "").replace(".pt", "") : shortName(ck)}`, css(CK_COLOR[index]), "rect"]) : [];
+};
+
+// ---------- Plotly styling ----------
+const CONFIG = {displayModeBar: false, responsive: true};
+const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+function layout(extra) {
+  return Object.assign({paper_bgcolor: css("--surface"), plot_bgcolor: css("--surface"), font: {family: FONT, size: 12, color: css("--ink-2")},
+    margin: {l: 60, r: 16, t: 34, b: 44}, showlegend: false, barcornerradius: 4, bargap: 0.45, bargroupgap: 0.12,
+    hoverlabel: {bgcolor: css("--surface"), bordercolor: css("--axis"), font: {family: FONT, color: css("--ink")}}}, extra);
+}
+const axis = extra => Object.assign({gridcolor: css("--grid"), linecolor: css("--axis"), zerolinecolor: css("--axis"), tickfont: {color: css("--muted")}, automargin: true, fixedrange: true}, extra);
+
+// Bars in one panel per split: x = the view's items, one bar per checkpoint
+function splitBars(container, view) {
+  const panels = view.splits || SPLITS, cks = selected(), traces = [], rows = [];
+  const panelWidth = (container.clientWidth - 90) / panels.length * 0.94;
+  cks.forEach((ck, index) => panels.forEach((split, panel) => {
+    const x = [], y = [], n = [];
+    for (const item of view.items) {
+      const subset = typeof item.subset === "function" ? item.subset(split) : (item.subset ?? "all");
+      if (subset === null) continue;
+      const value = metric(ck, item.experiment || view.experiment, item.metric || view.metric, split, subset, view.level ?? state.level);
+      x.push(wrap(item.label)); y.push(value ? value.value : null); n.push(value ? value.n : 0);
+      rows.push([cks.length > 1 ? "AB"[index] : shortName(ck), SPLIT_LABEL[split], item.label, value ? value.value : null, value ? value.n : null]);
+    }
+    const suffix = panel ? String(panel + 1) : "";
+    traces.push({type: "bar", x, y, customdata: n, name: cks.length > 1 ? "AB"[index] : "", xaxis: "x" + suffix, yaxis: "y" + suffix,
+      ...barGeometry(cks.length, panelWidth / Math.max(x.length, 1), index),
+      text: y.map(value => value === 0 ? "0" : ""), textposition: "outside", textfont: {color: css("--muted"), size: 11}, cliponaxis: false,  // a bar of height 0 is invisible: only those get a label
+      marker: {color: css(CK_COLOR[index])}, hovertemplate: `<b>%{y:.3g}</b><br>%{x} · n = %{customdata}<extra>${cks.length > 1 ? "AB"[index] : ""}</extra>`});
+  }));
+  if (!rows.some(row => row[3] !== null)) { container.replaceChildren(el("p", {class: "empty", text: "No values for this checkpoint and level."})); return rows; }
+  const extra = {grid: {rows: 1, columns: panels.length, pattern: "independent", xgap: 0.06}, annotations: [], shapes: []};
+  panels.forEach((split, panel) => {
+    const suffix = panel ? String(panel + 1) : "";
+    extra["xaxis" + suffix] = axis({type: "category", showgrid: false, tickangle: 0});
+    extra["yaxis" + suffix] = axis({range: view.range, matches: panel ? "y" : undefined, showticklabels: panel === 0, title: panel === 0 ? {text: view.y || "", font: {color: css("--ink-2")}} : undefined});
+    if (panels.length > 1) extra.annotations.push({text: SPLIT_LABEL[split], xref: `x${suffix} domain`, yref: "paper", x: 0, y: 1.1, xanchor: "left", showarrow: false, font: {color: css("--ink"), size: 13}});
+    if (view.reference) extra.shapes.push({type: "line", xref: `x${suffix} domain`, x0: 0, x1: 1, yref: "y" + suffix, y0: view.reference.y, y1: view.reference.y, line: {color: css("--muted"), width: 1}});  // named in the card's legend
+  });
+  Plotly.newPlot(container, traces, layout(Object.assign(extra, {height: view.height || 300})), CONFIG);
+  return rows;
+}
+
+// ---------- the views ----------
+const ROLLOUT_K = [1, 3, 5, 10];
+const OVERVIEW = [
+  {label: "Variance kept within levels", info: "latent_variance/within_level_share", experiment: "latent_variance", metric: "within_level_share", better: "higher"},
+  {label: "Move read from the latent change", info: "action_decoding/balanced_accuracy", experiment: "action_decoding", metric: "balanced_accuracy", subset: split => split === "unseen" ? "zero_shot" : "probe", better: "higher", note: "chance 0.25"},
+  {label: "Close states behave differently", info: "state_aliasing/effect_mismatch", experiment: "state_aliasing", metric: "effect_mismatch", subset: "same_level", better: "lower", note: "nearest, same level"},
+  {label: "One-step error ratio (game changes)", info: "one_step_prediction/error_ratio", experiment: "one_step_prediction", metric: "error_ratio", subset: "mechanics", better: "lower"},
+  {label: "Rollout error ratio after 10 steps", info: "multi_step_rollout/error_ratio", experiment: "multi_step_rollout", metric: "error_ratio", subset: "k10", better: "lower", note: "1 real frame"},
+  {label: "Gain from 3 real frames (k = 10)", info: "multi_step_rollout/error_ratio", better: "higher", note: "ratio with 1 minus with 3 real frames",
+   get: (ck, split) => { const one = metric(ck, "multi_step_rollout", "error_ratio", split, "k10"), three = metric(ck, "multi_step_rollout", "error_ratio", split, "k10_real3"); return one && three ? {value: one.value - three.value, n: one.n} : null; }},
+  {label: "CEM goals reached", info: "cem_planning/success_rate", experiment: "cem_planning", metric: "success_rate", better: "higher"},
+  {label: "Action ranking (Spearman)", info: "action_ranking/spearman", experiment: "action_ranking", metric: "spearman", better: "higher"},
+];
+const VIEWS = {
+  encoder: [
+    {type: "bars", title: "Can the move be read from how the latent changes?", info: "action_decoding/balanced_accuracy", experiment: "action_decoding", metric: "balanced_accuracy", range: [0, 1], y: "balanced accuracy",
+     reference: {y: 0.25, label: "chance"}, items: [{label: "trained probe", subset: split => split === "unseen" ? "zero_shot" : "probe"}, {label: "fine-tuned", subset: split => split === "unseen" ? "adapted" : null}]},
+    {type: "bars", title: "Do states that look close behave the same?", info: "state_aliasing/effect_mismatch", experiment: "state_aliasing", metric: "effect_mismatch", range: [0, 1], y: "pairs with a different effect",
+     subtitle: "Share of (state, neighbour, move) where the move does something different. Nearest neighbours should disagree much less often than random ones.",
+     items: [{label: "nearest, same level", subset: "same_level"}, {label: "random, same level", subset: "same_level_random"}, {label: "nearest, other levels", subset: "other_levels"}, {label: "random, other levels", subset: "other_levels_random"}]},
+    {type: "probes"},
+    {type: "tiles", title: "Variance and similarity", items: [
+      {label: "Latent variance", info: "latent_variance/latent_variance", experiment: "latent_variance", metric: "latent_variance"},
+      {label: "Variance kept within levels", info: "latent_variance/within_level_share", experiment: "latent_variance", metric: "within_level_share", better: "higher"},
+      {label: "Similarity to the compared checkpoint", info: "checkpoint_similarity/cka", experiment: "checkpoint_similarity", metric: "cka"}]},
+    {type: "bars", title: "How many directions does the latent space use?", info: "latent_maps/explained_variance", experiment: "latent_maps", metric: "explained_variance", splits: ["all"], level: "all", y: "explained variance",
+     subtitle: "PCA over the latents of all splits; always over all levels.", items: Array.from({length: 10}, (_, i) => ({label: `pc${i + 1}`, subset: `pc${i + 1}`}))},
+  ],
+  predictor: [
+    {type: "rollout"},
+    {type: "bars", title: "Does it know what each move would do?", info: "counterfactual_actions/error_ratio", experiment: "counterfactual_actions", metric: "error_ratio", y: "error ratio", reference: {y: 1, label: "nothing changes"},
+     subtitle: "All 4 moves from the same state, with up to 3 real frames of history.", items: ["up", "down", "left", "right"].map(move => ({label: move, subset: move})).concat([{label: "all moves", subset: "all"}])},
+    {type: "bars", title: "…by what the move really did", info: "counterfactual_actions/error_ratio_by_change", experiment: "counterfactual_actions", metric: "error_ratio_by_change", y: "error ratio", reference: {y: 1, label: "nothing changes"},
+     items: [{label: "blocked (energy only)", subset: "energy_only"}, {label: "game changed", subset: "mechanics"}]},
+    {type: "tiles", title: "Differences between moves", items: [
+      {label: "Effect error ratio", info: "counterfactual_actions/effect_error_ratio", experiment: "counterfactual_actions", metric: "effect_error_ratio", subset: "different", better: "lower", note: "different outcomes"},
+      {label: "Effect error, identical outcomes", info: "counterfactual_actions/effect_error", experiment: "counterfactual_actions", metric: "effect_error", subset: "identical", better: "lower"},
+      {label: "Predicted difference", info: "counterfactual_actions/predicted_difference", experiment: "counterfactual_actions", metric: "predicted_difference", subset: "different"},
+      {label: "Real difference", info: "counterfactual_actions/real_difference", experiment: "counterfactual_actions", metric: "real_difference", subset: "different"}]},
+  ],
+  world_model: [
+    {type: "bars", title: "Next state from one real frame", info: "one_step_prediction/error_ratio", experiment: "one_step_prediction", metric: "error_ratio", y: "error ratio", reference: {y: 1, label: "nothing changes"},
+     subtitle: "The planner's first step: the state alone and the recorded move.", items: [{label: "all steps", subset: "all"}, {label: "blocked (energy only)", subset: "energy_only"}, {label: "game changed", subset: "mechanics"}]},
+    {type: "tiles", title: "Errors behind the ratio", items: [
+      {label: "Prediction error", info: "one_step_prediction/prediction_error", experiment: "one_step_prediction", metric: "prediction_error", better: "lower"},
+      {label: "Copy error", info: "one_step_prediction/copy_error", experiment: "one_step_prediction", metric: "copy_error"},
+      {label: "Prediction error, nothing changed", info: "one_step_prediction/prediction_error", experiment: "one_step_prediction", metric: "prediction_error", subset: "none", better: "lower"}]},
+  ],
+  planning: [
+    {type: "bars", title: "Can it steer the real game?", info: "cem_planning/success_rate", y: "share", range: [0, 1], items: [
+      {label: "goal 5 steps", experiment: "cem_planning", metric: "success_rate", subset: "goal5"}, {label: "goal 10 steps", experiment: "cem_planning", metric: "success_rate", subset: "goal10"},
+      {label: "goal 25 steps", experiment: "cem_planning", metric: "success_rate", subset: "goal25"}, {label: "waypoints reached", experiment: "cem_planning", metric: "waypoints_reached_fraction", subset: "waypoints"},
+      {label: "level completed", experiment: "cem_planning", metric: "level_completion_rate", subset: "waypoints"}]},
+    {type: "tiles", title: "Planning details", items: [
+      {label: "Action ranking (Spearman)", info: "action_ranking/spearman", experiment: "action_ranking", metric: "spearman", better: "higher"},
+      {label: "Action spread", info: "action_ranking/action_spread", experiment: "action_ranking", metric: "action_spread"},
+      {label: "Moves per goal attempt", info: "cem_planning/steps", experiment: "cem_planning", metric: "steps", better: "lower"},
+      {label: "Waypoints reached", info: "cem_planning/waypoints_reached_fraction", experiment: "cem_planning", metric: "waypoints_reached_fraction", subset: "waypoints", better: "higher"}]},
+  ],
+  generalization: [{type: "gaps", kind: "share"}, {type: "gaps", kind: "ratio"}, {type: "probes", unseenOnly: true}],
+};
+// Split gaps in two charts, one unit each: values between 0 and 1 (or -1 and 1) as plain differences, error ratios as % change (a % of a value near 0 explodes)
+const GAPS = {
+  share: {title: "Split gaps: accuracies and shares", relative: false,
+    subtitle: "Difference to the earlier split: seen val − seen train (memorization) and unseen − seen val (transfer to new levels). All lie between 0 and 1 (Spearman: −1 and 1). "
+      + "A fall is worse, except for \"close states behave differently\". Always over all levels.",
+    items: [["Move read from the latent change", "action_decoding/balanced_accuracy/probe"], ["Variance kept within levels", "latent_variance/within_level_share/all"],
+            ["Close states behave differently", "state_aliasing/effect_mismatch/same_level"], ["CEM goals reached", "cem_planning/success_rate/all"],
+            ["Action ranking (Spearman)", "action_ranking/spearman/all"]]},
+  ratio: {title: "Split gaps: error ratios", relative: true,
+    subtitle: "Change from the earlier split in % of its value there: seen val vs seen train (memorization) and unseen vs seen val (transfer to new levels). A rise is worse. Always over all levels.",
+    items: [["One-step error ratio (game changes)", "one_step_prediction/error_ratio/mechanics"], ["Counterfactual error ratio", "counterfactual_actions/error_ratio/all"],
+            ["Rollout error ratio, k = 10", "multi_step_rollout/error_ratio/k10"], ["Rollout error ratio, k = 10, 3 real frames", "multi_step_rollout/error_ratio/k10_real3"]]},
+};
+
+// ---------- renderers ----------
+function renderTiles(parent, items, title) {
+  const cks = selected(), box = el("div", {class: "tiles"});
+  const value = (item, ck, split) => item.get ? item.get(ck, split) : metric(ck, item.experiment, item.metric, split, typeof item.subset === "function" ? item.subset(split) : (item.subset ?? "all"));
+  for (const item of items) {
+    if (!cks.some(ck => SPLITS.some(split => value(item, ck, split)))) continue;  // e.g. the similarity to a compared checkpoint, only with --compare-to
+    const main = value(item, cks[0], "seen_val");
+    const others = ["seen_train", "unseen"].map(split => `${SPLIT_LABEL[split]} ${format(value(item, cks[0], split)?.value)}`).join(" · ");
+    const tile = el("div", {class: "tile"}, el("div", {class: "label"}, document.createTextNode(item.label), infoButton(item.info)),
+      item.note ? el("div", {class: "note", text: item.note}) : null,
+      el("div", {class: "value"}, document.createTextNode(format(main?.value)), el("small", {text: "seen val"})),
+      el("div", {class: "others", text: others}));
+    if (cks.length > 1) {
+      const other = value(item, cks[1], "seen_val"), difference = main && other ? other.value - main.value : null;
+      const verdict = difference === null || !item.better || difference === 0 ? "" : (difference > 0) === (item.better === "higher") ? " (B better)" : " (B worse)";
+      tile.append(el("div", {class: "compare"}, el("i", {class: "key-rect", style: `background:${css("--ck-b")}`}), document.createTextNode(`B ${format(other?.value)}  ${signed(difference)}${verdict}`)));
+    }
+    box.append(tile);
+  }
+  const shell = card(title || "Key numbers", null, cks.length > 1 ? "Big number: checkpoint A on seen val. B: the compared checkpoint and its difference to A." : "Big number: seen val; below: the other splits.");
+  shell.body.append(box);
+  shell.setTable([["metric"], ...cks.flatMap((ck, index) => SPLITS.map(split => [`${cks.length > 1 ? "AB"[index] + " " : ""}${SPLIT_LABEL[split]}`, true]))],
+    items.map(item => [item.label, ...cks.flatMap(ck => SPLITS.map(split => value(item, ck, split)?.value ?? null))]));
+  parent.append(shell.node);
+}
+
+function renderBars(parent, view) {
+  const reference = view.reference ? [[`${view.reference.label} (${view.reference.y})`, css("--muted"), "line"]] : [];
+  const shell = card(view.title, view.info, view.subtitle, [...checkpointLegend(), ...reference]);
+  parent.append(shell.node);
+  const rows = splitBars(shell.body, view);
+  shell.setTable([["checkpoint"], ["split"], ["item"], ["value", true], ["n", true]], rows);
+}
+
+function renderRollout(parent) {
+  const cks = selected(), colours = [1, 2, 3].map(real => css(`--ord-${real}`));
+  const legend = [...[1, 2, 3].map(real => [`${real} real frame${real > 1 ? "s" : ""}`, colours[real - 1], "line"]), ["nothing changes (1)", css("--muted"), "line"]];
+  const shell = card("Does the error grow over a rollout, and does real history help?", "multi_step_rollout/error_ratio",
+    "The model predicts k steps ahead from its own predictions. 1 real frame is the planner's situation; 2 and 3 add the real states before the start.", legend);
+  parent.append(shell.node);
+  const rows = [], subset = (k, real) => `k${k}${real > 1 ? "_real" + real : ""}`;
+  const peak = Math.max(1, ...cks.flatMap(ck => SPLITS.flatMap(split => [1, 2, 3].flatMap(real => ROLLOUT_K.map(k => metric(ck, "multi_step_rollout", "error_ratio", split, subset(k, real))?.value ?? 0)))));  // one scale for the rows of A and B
+  for (const [index, ck] of cks.entries()) {
+    const traces = [], extra = {grid: {rows: 1, columns: 3, pattern: "independent", xgap: 0.06}, annotations: [], shapes: []};
+    SPLITS.forEach((split, panel) => {
+      const suffix = panel ? String(panel + 1) : "";
+      for (const real of [1, 2, 3]) {
+        const y = ROLLOUT_K.map(k => metric(ck, "multi_step_rollout", "error_ratio", split, subset(k, real))?.value ?? null);
+        ROLLOUT_K.forEach((k, position) => rows.push([cks.length > 1 ? "AB"[index] : shortName(ck), SPLIT_LABEL[split], real, k, y[position]]));
+        traces.push({type: "scatter", mode: "lines+markers", x: ROLLOUT_K, y, xaxis: "x" + suffix, yaxis: "y" + suffix, name: `${real} real`, line: {color: colours[real - 1], width: 2},
+          marker: {size: 8, color: colours[real - 1], line: {color: css("--surface"), width: 2}}, hovertemplate: `<b>%{y:.3g}</b><br>k = %{x} · ${real} real frame${real > 1 ? "s" : ""}<extra></extra>`});
+      }
+      extra["xaxis" + suffix] = axis({tickvals: ROLLOUT_K, title: {text: "steps ahead (k)", font: {color: css("--ink-2")}}, showgrid: false});
+      extra["yaxis" + suffix] = axis({matches: panel ? "y" : undefined, range: [0, peak * 1.08], showticklabels: panel === 0, title: panel === 0 ? {text: "error ratio", font: {color: css("--ink-2")}} : undefined});
+      extra.annotations.push({text: SPLIT_LABEL[split], xref: `x${suffix} domain`, yref: "paper", x: 0, y: 1.1, xanchor: "left", showarrow: false, font: {color: css("--ink"), size: 13}});
+      extra.shapes.push({type: "line", xref: `x${suffix} domain`, x0: 0, x1: 1, yref: "y" + suffix, y0: 1, y1: 1, line: {color: css("--muted"), width: 1}});
+    });
+    const box = el("div");
+    if (cks.length > 1) shell.body.append(el("h4", {class: "secondary", style: "margin:12px 0 0;font-size:13px", text: `${"AB"[index]}: ${shortName(ck)}`}));
+    shell.body.append(box);
+    Plotly.newPlot(box, traces, layout(Object.assign(extra, {height: 300, hovermode: "x"})), CONFIG);
+  }
+  shell.setTable([["checkpoint"], ["split"], ["real frames", true], ["k", true], ["error ratio", true]], rows);
+}
+
+function renderProbes(parent, view) {
+  const cks = selected(), facts = [];
+  for (const row of cks[0].metrics) {
+    const name = row[C.metric];
+    if (row[C.experiment] === "state_probes" && /\/(balanced_accuracy|mae)$/.test(name) && !facts.includes(name)) facts.push(name);
+  }
+  const columns = view.unseenOnly
+    ? [["unseen", "zero_shot", "zero-shot"], ["unseen", "adapted", "fine-tuned"], ["unseen", "adapted_minus_zero_shot", "gain from fine-tuning"], ["unseen", "level_baseline", "level baseline"]]
+    : [["seen_train", "probe", "seen train"], ["seen_val", "probe", "seen val"], ["seen_val", "level_baseline", "level baseline"], ["seen_val", "global_baseline", "global baseline"]];
+  const shell = card(view.unseenOnly ? "Probes on levels the model never saw" : "Which facts can be read from the latent?", view.unseenOnly ? "state_probes/x/balanced_accuracy" : "state_probes/x/balanced_accuracy",
+    view.unseenOnly ? "Zero-shot: the probe trained on seen levels. Fine-tuned: a copy trained a little on the unseen adapt half. Tested on the unseen eval half."
+                    : "Bold: the probe beats the level baseline, so the latent stores the fact itself, not just the level." + (cks.length > 1 ? " Grey: checkpoint B." : ""));
+  parent.append(shell.node);
+  if (!facts.length) { shell.body.append(el("p", {class: "empty", text: "No probe results for this checkpoint."})); return; }
+  const head = el("tr", {}, el("th", {text: "fact"}), el("th", {}, document.createTextNode("measure ")), ...columns.map(([, , label]) => el("th", {class: "num", text: label})), el("th", {class: "num"}, document.createTextNode("varies in levels "), infoButton("state_probes/x/varying_levels")));
+  const body = el("tbody"), rows = [];
+  for (const name of facts) {
+    const [fact, measure] = name.split("/"), higher = measure === "balanced_accuracy";
+    if (!columns.some(([split, subset]) => cks.some(ck => metric(ck, "state_probes", name, split, subset)))) continue;  // e.g. "level" on unseen levels
+    const cells = columns.map(([split, subset]) => {
+      const values = cks.map(ck => metric(ck, "state_probes", name, split, subset)?.value ?? null);
+      const baseline = metric(cks[0], "state_probes", name, split, "level_baseline")?.value;
+      const better = ["probe", "zero_shot", "adapted"].includes(subset) && values[0] !== null && baseline !== undefined && (higher ? values[0] > baseline : values[0] < baseline);
+      return el("td", {class: "num" + (better ? " better" : "")}, document.createTextNode(format(values[0])), cks.length > 1 ? el("span", {class: "b", text: `B ${format(values[1])}`}) : null);
+    });
+    const varying = metric(cks[0], "state_probes", `${fact}/varying_levels`, view.unseenOnly ? "unseen" : "seen_val")?.value;
+    body.append(el("tr", {}, el("td", {text: fact.replaceAll("_", " ")}), el("td", {class: "secondary"}, document.createTextNode(higher ? "accuracy " : "mean abs. error "), infoButton(name)), ...cells, el("td", {class: "num", text: varying === undefined ? "–" : `${Math.round(varying * 100)}%`})));
+    rows.push([fact, measure, ...columns.map(([split, subset]) => metric(cks[0], "state_probes", name, split, subset)?.value ?? null), varying ?? null]);
+  }
+  shell.body.append(el("div", {class: "table-box", style: "max-height:none"}, el("table", {}, el("thead", {}, head), body)));
+  shell.setTable([["fact"], ["measure"], ...columns.map(([, , label]) => [label, true]), ["varies in levels", true]], rows);
+}
+
+function renderGaps(parent, kind) {
+  const spec = GAPS[kind], cks = selected(), traces = [], rows = [], height = 110 + 52 * spec.items.length;
+  const shell = card(spec.title, "split_gaps/x", spec.subtitle, checkpointLegend());
+  parent.append(shell.node);
+  const labels = spec.items.map(([label]) => label).reverse();
+  cks.forEach((ck, index) => [["val_minus_train", "seen_train"], ["unseen_minus_val", "seen_val"]].forEach(([subset, earlier], panel) => {
+    const gaps = spec.items.map(([, name]) => {
+      const gap = metric(ck, "split_gaps", name, "all", subset, "all")?.value ?? null;
+      const [experiment, metricName, metricSubset] = [name.split("/")[0], name.split("/").slice(1, -1).join("/"), name.split("/").pop()];
+      const base = metric(ck, experiment, metricName, earlier, metricSubset, "all")?.value;
+      return {gap, shown: !spec.relative ? gap : gap !== null && base ? 100 * gap / Math.abs(base) : null};
+    });
+    spec.items.forEach(([label], position) => rows.push([cks.length > 1 ? "AB"[index] : shortName(ck), subset.replaceAll("_", " "), label, gaps[position].gap, spec.relative ? gaps[position].shown : null]));
+    traces.push({type: "bar", orientation: "h", x: gaps.map(entry => entry.shown).reverse(), y: labels, customdata: gaps.map(entry => entry.gap).reverse(),
+      xaxis: panel ? "x2" : "x", yaxis: panel ? "y2" : "y", ...barGeometry(cks.length, (height - 74) / spec.items.length, index), marker: {color: css(CK_COLOR[index])},
+      hovertemplate: (spec.relative ? "<b>%{x:+.1f}%</b><br>%{y}<br>difference %{customdata:+.3g}" : "<b>%{x:+.3g}</b><br>%{y}") + `<extra>${cks.length > 1 ? "AB"[index] : ""}</extra>`});
+  }));
+  if (!rows.some(row => row[3] !== null)) { shell.body.append(el("p", {class: "empty", text: "No split gaps: they need seen and unseen results."})); return; }
+  const box = el("div"); shell.body.append(box);
+  const suffix = spec.relative ? "%" : "";
+  Plotly.newPlot(box, traces, layout({height, margin: {l: 260, r: 16, t: 34, b: 40}, grid: {rows: 1, columns: 2, pattern: "independent", xgap: 0.08},
+    xaxis: axis({zeroline: true, zerolinewidth: 1, ticksuffix: suffix}), xaxis2: axis({zeroline: true, zerolinewidth: 1, ticksuffix: suffix}), yaxis: axis({showgrid: false}), yaxis2: axis({showgrid: false, matches: "y", showticklabels: false}),
+    annotations: [["seen val − seen train", "x domain"], ["unseen − seen val", "x2 domain"]].map(([text, xref]) => ({text, xref, yref: "paper", x: 0, y: 1.08, xanchor: "left", showarrow: false, font: {color: css("--ink"), size: 13}}))}), CONFIG);
+  shell.setTable([["checkpoint"], ["gap"], ["metric"], ["difference", true], ["change in %", true]], rows);
+}
+
+function renderMaps(parent) {
+  const cks = selected().filter(ck => Object.keys(ck.maps).length);
+  if (!cks.length) { parent.append(el("p", {class: "empty", text: "No latent maps for this checkpoint."})); return; }
+  const names = Object.keys(cks[0].maps);
+  if (!names.includes(state.map)) state.map = names[0];
+  const control = (label, options, current, onChange) => {
+    const select = el("select", {}, ...options.map(([value, text]) => { const option = el("option", {value, text}); option.selected = value === current; return option; }));
+    select.addEventListener("change", () => { onChange(select.value); render(); });
+    return el("label", {}, document.createTextNode(label), select);
+  };
+  const colouring = [["split", "split"], ["level", "the level chosen above"], ["label_player_x", "player x"], ["label_player_y", "player y"], ["label_goal_distance", "goal distance"], ["label_key_matches_goal", "symbol fits goal"]];
+  parent.append(el("div", {class: "controls"},
+    control("Map", names.map(name => [name, name === "all" ? "all states" : name.replace("_", " ")]), state.map, value => { state.map = value; }),
+    control("Projection", [["umap3", "UMAP 3D"], ["pca3", "PCA 3D"], ["umap2", "UMAP 2D"]], state.projection, value => { state.projection = value; }),
+    control("Colour by", colouring, state.colour, value => { state.colour = value; }),
+    infoButton("latent_maps/explained_variance")));
+  const grid = el("div", {class: "maps"}); parent.append(grid);
+  for (const [index, ck] of cks.entries()) {
+    const map = ck.maps[state.map];
+    const box = el("div", {class: "card"}, el("h4", {text: cks.length > 1 ? `${"AB"[index]}: ${shortName(ck)}` : shortName(ck)}));
+    const plot = el("div"); box.append(plot); grid.append(box);
+    if (!map) { plot.append(el("p", {class: "empty", text: "This checkpoint has no such map."})); continue; }
+    const columns = state.projection === "pca3" ? ["pca_1", "pca_2", "pca_3"] : state.projection === "umap3" ? ["umap3_1", "umap3_2", "umap3_3"] : ["umap2_1", "umap2_2"];
+    const three = columns.length === 3, count = map[columns[0]].length;
+    const hover = Array.from({length: count}, (_, i) => `${SPLIT_LABEL[map.split[i]]} · level ${map.level[i]}<br>player (${map.label_player_x[i]}, ${map.label_player_y[i]}) · goal distance ${map.label_goal_distance[i]}<br>${map.dataset[i]} · episode ${map.episode[i]} · step ${map.step[i]}`);
+    const trace = (indices, name, colour, extra = {}) => Object.assign({type: three ? "scatter3d" : "scattergl", mode: "markers", name,
+      x: indices.map(i => map[columns[0]][i]), y: indices.map(i => map[columns[1]][i]), ...(three ? {z: indices.map(i => map[columns[2]][i])} : {}),
+      text: indices.map(i => hover[i]), hovertemplate: "%{text}<extra></extra>", marker: Object.assign({size: three ? 2.6 : 4, color: colour, opacity: 0.85}, extra)});
+    const all = Array.from({length: count}, (_, i) => i), traces = [];
+    if (state.colour === "split") {
+      SPLITS.forEach((split, position) => { const indices = all.filter(i => map.split[i] === split); if (indices.length) traces.push(trace(indices, SPLIT_LABEL[split], css(`--split-${position + 1}`))); });
+    } else if (state.colour === "level") {
+      const chosen = all.filter(i => String(map.level[i]) === String(state.level));
+      traces.push(trace(all.filter(i => String(map.level[i]) !== String(state.level)), "other levels", css("--rest"), {opacity: 0.35}));
+      if (chosen.length) traces.push(trace(chosen, `level ${state.level}`, css("--ck-a")));
+    } else if (state.colour === "label_key_matches_goal") {
+      traces.push(trace(all.filter(i => map.label_key_matches_goal[i] !== 1), "symbol does not fit", css("--rest"), {opacity: 0.5}));
+      traces.push(trace(all.filter(i => map.label_key_matches_goal[i] === 1), "symbol fits goal", css("--ck-a")));
+    } else {
+      const known = all.filter(i => map[state.colour][i] >= 0), missing = all.filter(i => map[state.colour][i] < 0);
+      if (missing.length) traces.push(trace(missing, "unknown", css("--rest"), {opacity: 0.35}));
+      traces.push(trace(known, colouring.find(([value]) => value === state.colour)[1], null, {color: known.map(i => map[state.colour][i]),
+        colorscale: [0, 1, 2, 3].map(step => [step / 3, css(`--seq-${step}`)]), colorbar: {thickness: 10, outlinewidth: 0, tickfont: {color: css("--muted")}}}));
+    }
+    const hiddenAxis = {showticklabels: false, title: {text: ""}, showgrid: true, gridcolor: css("--grid"), zeroline: false, showbackground: false, showspikes: false};
+    Plotly.newPlot(plot, traces, layout({height: 560, margin: {l: 8, r: 8, t: 8, b: 8}, showlegend: traces.length > 1 && !traces.some(t => t.marker.colorscale),
+      legend: {orientation: "h", y: 1, x: 0, font: {color: css("--ink-2")}, itemsizing: "constant"},
+      ...(three ? {scene: {xaxis: hiddenAxis, yaxis: hiddenAxis, zaxis: hiddenAxis, bgcolor: css("--surface")}} : {xaxis: axis({showticklabels: false, fixedrange: false}), yaxis: axis({showticklabels: false, fixedrange: false})})}),
+      Object.assign({}, CONFIG, {scrollZoom: true}));
+  }
+  if (state.colour === "level" && state.level === "all") parent.append(el("p", {class: "muted", text: "Choose a level in the Level filter above to highlight it."}));
+}
+
+function renderTable(parent) {
+  const cks = selected(), search = el("input", {type: "search", placeholder: "Filter: experiment, metric, subset…", "aria-label": "Filter metrics"});
+  const box = el("div", {class: "table-box", style: "max-height:70vh"});
+  const shell = card("All metrics", null, `Every metric row of ${cks.length > 1 ? "both checkpoints" : "this checkpoint"} for the chosen level (${state.level === "all" ? "all levels" : "level " + state.level}).`);
+  shell.body.append(search, box); parent.append(shell.node);
+  const entries = new Map();
+  for (const [index, ck] of cks.entries()) for (const row of ck.metrics) {
+    if (String(row[C.level]) !== String(state.level)) continue;
+    const id = key(row[C.group], row[C.experiment], row[C.metric], row[C.subset]);
+    if (!entries.has(id)) entries.set(id, {group: row[C.group], experiment: row[C.experiment], metric: row[C.metric], subset: row[C.subset], values: {}});
+    entries.get(id).values[`${index}|${row[C.split]}`] = row[C.value];
+  }
+  const splits = ["seen_train", "seen_val", "unseen", "all"], order = Object.keys(DATA.groups);
+  const list = [...entries.values()].sort((a, b) => order.indexOf(a.group) - order.indexOf(b.group) || a.experiment.localeCompare(b.experiment) || a.metric.localeCompare(b.metric) || a.subset.localeCompare(b.subset, undefined, {numeric: true}));
+  const draw = () => {
+    const query = search.value.trim().toLowerCase();
+    const shown = list.filter(entry => !query || `${entry.group} ${entry.experiment} ${entry.metric} ${entry.subset}`.toLowerCase().includes(query)).slice(0, 3000);
+    const head = el("tr", {}, ...["group", "experiment", "metric", "subset"].map(text => el("th", {text})), ...splits.map(split => el("th", {class: "num", text: SPLIT_LABEL[split]})));
+    box.replaceChildren(el("table", {}, el("thead", {}, head), el("tbody", {}, ...shown.map(entry => el("tr", {},
+      el("td", {class: "secondary", text: entry.group}), el("td", {text: entry.experiment}), el("td", {}, document.createTextNode(entry.metric + " "), infoButton(`${entry.experiment}/${entry.metric}`)), el("td", {text: entry.subset}),
+      ...splits.map(split => el("td", {class: "num"}, document.createTextNode(format(entry.values[`0|${split}`])), cks.length > 1 ? el("span", {class: "b", text: `B ${format(entry.values[`1|${split}`])}`}) : null)))))));
+  };
+  search.addEventListener("input", draw); draw();
+  shell.setTable([["group"], ["experiment"], ["metric"], ["subset"], ...cks.flatMap((ck, index) => splits.map(split => [`${cks.length > 1 ? "AB"[index] + " " : ""}${SPLIT_LABEL[split]}`, true]))],
+    list.map(entry => [entry.group, entry.experiment, entry.metric, entry.subset, ...cks.flatMap((ck, index) => splits.map(split => entry.values[`${index}|${split}`] ?? null))]));
+}
+
+function renderRun(parent) {
+  const strip = el("div", {class: "run"});
+  for (const [index, ck] of selected().entries()) {
+    const info = ck.checkpoint, sets = ck.evaluation_sets || {};
+    const counts = table([["split"], ["levels", true], ["states", true], ["windows", true], ["dropped episodes", true]],
+      Object.entries(sets).map(([split, counts]) => [SPLIT_LABEL[split] || split, counts.levels, counts.states, counts.windows, counts.dropped_episodes]));
+    const head = el("div", {class: "card-head"}, selected().length > 1 ? el("i", {class: "key-rect", style: `background:${css(CK_COLOR[index])}`}) : null, el("h3", {text: `${selected().length > 1 ? "AB"[index] + ": " : ""}${shortName(ck)}`}));
+    const facts = [`dataset ${info.dataset} (version ${ck.dataset_version})`, `history ${info.history_size} · window ${info.window} · seed ${info.seed}`,
+      `${(ck.training_levels || []).length} training levels, ${(ck.seen_levels_evaluated || []).length} evaluated`, `unseen: ${(ck.unseen || []).join(", ") || "none"}`,
+      `parameters "${ck.experiment_parameters?.name}" · evaluated ${ck.evaluated}`];
+    strip.append(el("section", {class: "card"}, head, el("p", {class: "sub", text: facts.join(" · ")}), counts,
+      el("div", {class: "splitdefs"}, ...SPLITS.map(split => el("span", {}, document.createTextNode(SPLIT_LABEL[split]), infoButton({title: SPLIT_LABEL[split], text: DATA.splits[split]}))))));
+  }
+  parent.append(strip);
+}
+
+// ---------- page ----------
+const TABS = [["overview", "Overview"], ["encoder", "Encoder"], ["predictor", "Predictor"], ["world_model", "World model"], ["planning", "Planning"], ["generalization", "Generalization"], ["maps", "Latent maps"], ["table", "All metrics"]];
+function render() {
+  const main = document.getElementById("main");
+  main.replaceChildren();
+  document.querySelectorAll("nav.tabs button").forEach(button => button.setAttribute("aria-selected", String(button.dataset.tab === state.tab)));
+  if (DATA.groups[state.tab]) main.append(el("p", {class: "question", text: DATA.groups[state.tab]}));
+  if (state.tab === "overview") { renderRun(main); renderTiles(main, OVERVIEW, "Key numbers"); renderRollout(main); }
+  else if (state.tab === "maps") renderMaps(main);
+  else if (state.tab === "table") renderTable(main);
+  else for (const view of VIEWS[state.tab]) {
+    if (view.type === "bars") renderBars(main, view);
+    else if (view.type === "tiles") renderTiles(main, view.items, view.title);
+    else if (view.type === "rollout") renderRollout(main);
+    else if (view.type === "probes") renderProbes(main, view);
+    else if (view.type === "gaps") renderGaps(main, view.kind);
+  }
+}
+function setup() {
+  const a = document.getElementById("ck-a"), b = document.getElementById("ck-b"), level = document.getElementById("level"), theme = document.getElementById("theme");
+  const options = (select, withNone, current) => select.replaceChildren(...(withNone ? [el("option", {value: "-1", text: "nothing"})] : []),
+    ...byTime.slice().reverse().map(index => { const option = el("option", {value: String(index), text: shortName(DATA.checkpoints[index])}); option.selected = index === current; return option; }));
+  const levels = () => {
+    const found = new Set();
+    for (const ck of selected()) for (const row of ck.metrics) if (row[C.level] !== "all") found.add(Number(row[C.level]));
+    const sorted = [...found].sort((x, y) => x - y);
+    level.replaceChildren(el("option", {value: "all", text: "all levels"}), ...sorted.map(number => { const option = el("option", {value: String(number), text: number <= 7 ? `level ${number} (real)` : `level ${number}`}); option.selected = String(number) === String(state.level); return option; }));
+  };
+  options(a, false, state.a); options(b, true, state.b); levels();
+  a.addEventListener("change", () => { state.a = Number(a.value); levels(); render(); });
+  b.addEventListener("change", () => { state.b = Number(b.value); levels(); render(); });
+  level.addEventListener("change", () => { state.level = level.value; render(); });
+  theme.addEventListener("change", () => { if (theme.value === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme.value; render(); });
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+  const tabs = document.getElementById("tabs");
+  for (const [id, label] of TABS) {
+    const button = el("button", {type: "button", role: "tab", "data-tab": id, text: label});
+    button.addEventListener("click", () => { state.tab = id; history.replaceState(null, "", `#${id}`); render(); });
+    tabs.append(button);
+  }
+  if (TABS.some(([id]) => id === location.hash.slice(1))) state.tab = location.hash.slice(1);  // a link can open a tab, e.g. dashboard.html#encoder
+  document.getElementById("subtitle").textContent = `${DATA.checkpoints.length} analysed checkpoint${DATA.checkpoints.length > 1 ? "s" : ""} · ls20`;
+  render();
+}
+setup();
+</script>
+</body>
+</html>
