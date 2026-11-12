@@ -6,8 +6,9 @@ $STABLEWM_HOME/
 ├── recordings/<game>/<collection>/     raw JSONL episodes + collection.json
 ├── synthetic_data/<game>/<collection>/ the same for the synthetic levels (arc_levelgen): solutions + Goose branches
 ├── datasets/<game>/<dataset>.lance     converted Lance datasets (+ <dataset>.json provenance)
+├── datasets/<game>/d_jepa_<name>/      labelled plans for D-JEPA's ranker (environments/d_jepa_collection.py)
 ├── evaluation/<game>/                  evaluation outputs, file names start with the dataset/model name
-└── models/<kind>/<run>/                everything of one trained model; kind = "lewm" or "ppo"
+└── models/<kind>/<run>/                everything of one trained model; kind = "lewm", "ppo" or "d_jepa"
 
 <game> is the base game id without version ("ls20-9607627b" -> "ls20").
 Collections and model runs end with a local MMDD-HHMM timestamp.
@@ -17,7 +18,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-MODEL_KINDS = ("lewm", "ppo")  # allowed sub-folders of models/
+MODEL_KINDS = ("lewm", "ppo", "d_jepa")  # allowed sub-folders of models/ (d_jepa: rankers fitted on top of a LeWM checkpoint, training/d_jepa.py)
 
 
 def stablewm_home() -> Path:
@@ -56,6 +57,11 @@ def synthetic_dir(game_id: str) -> Path:
 def dataset_path(game_id: str, name: str) -> Path:
   """Lance table path of a dataset of one game."""
   return stablewm_home() / "datasets" / game_folder(game_id) / f"{name}.lance"  # e.g. datasets/ls20/goose_l1-7.lance
+
+
+def d_jepa_data_dir(game_id: str, name: str) -> Path:
+  """Folder of a D-JEPA dataset: situations with the outcome of every plan (environments/d_jepa_collection.py)."""
+  return stablewm_home() / "datasets" / game_folder(game_id) / f"d_jepa_{name}"  # e.g. datasets/ls20/d_jepa_syn1000
 
 
 def evaluation_dir(game_id: str) -> Path:

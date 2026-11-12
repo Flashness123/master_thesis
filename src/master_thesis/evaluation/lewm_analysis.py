@@ -58,6 +58,7 @@ The experiments, in the groups the dashboard will show:
     one_step_prediction     the next state from one frame and the action, compared with "nothing changes"
   planning: can the model steer the game?
     cem_planning            reach goal states and follow a recorded solution with CEM in the real game
+                            (ExhaustivePlanner, which tries every action sequence, exists but no experiment uses it yet)
     action_ranking          does the predictor rank the actions towards a goal like the real game does?
   generalization: what changes between known and new data?
     split_gaps              for every metric: seen_val minus seen_train, and unseen minus seen_val
@@ -89,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -715,6 +717,50 @@ class CemPlanner:
     if not self.queue:
       plan = self.solver.solve({"pixels": self.pixels(grid), "goal": self.goal, "action": self.dummy_action})
       self.queue = [int(action) + 1 for action in plan["actions"][0, :self.replan_every, 0]]  # the solver counts actions from 0
+    return self.queue.pop(0)
+
+
+class ExhaustivePlanner:
+  """
+  Plan like CemPlanner, but try every action sequence instead of sampling some: with 4 moves and a horizon of 5 there
+  are only 4^5 = 1,024 sequences, fewer than CEM evaluates (samples x iterations). The model imagines all of them from
+  the current frame, the cheapest one under the same cost as CemPlanner (closest approach to the goal, or the last
+  imagined state: cost_on) is played for replan_every moves, then it plans again.
+  Why: CEM's plan is the most frequent elite move at each step, which can be a sequence it never tried, and it changes
+  with the random seed. This planner returns the exact best sequence under the model's cost, the same every time, so
+  its failures are the model's and not the search's. The number of sequences grows as 4^horizon (65,536 for 8 moves),
+  so this only works for few actions and short horizons.
+  Equal costs (e.g. sequences that differ only after their closest approach to the goal) go to the sequence that ends
+  closer to the goal, then to the first one in the enumeration.
+  """
+
+  def __init__(self, model, img_size: int, goal_grid, parameters):
+    from master_thesis.training.lewm import ArcGridToPixels
+
+    self.model, self.device, self.cost_on = model, parameters.device, parameters.cost_on
+    self.replan_every = min(parameters.replan_every, parameters.horizon)
+    self.to_pixels = ArcGridToPixels(img_size)
+    self.goal = self.pixels(goal_grid)
+    self.dummy_action = torch.zeros(1, 1, ACTION_DIM, device=parameters.device)  # JEPA.get_cost needs an action entry; the imagined plans replace it
+    self.queue = []  # the actions of the current plan still to play
+    self.sequences = torch.tensor(list(itertools.product(range(len(ACTIONS)), repeat=parameters.horizon)), device=parameters.device)  # every sequence of moves 0-3  [4^horizon, horizon]
+    self.candidates = torch.nn.functional.pad(torch.nn.functional.one_hot(self.sequences, len(ACTIONS)).float(), (0, ACTION_DIM - len(ACTIONS)))[None]  # as LeWM's 9 numbers per move  [1, 4^horizon, horizon, 9]
+
+  def pixels(self, grid):
+    return self.to_pixels(torch.as_tensor(np.asarray(grid).reshape(1, -1), device=self.device))[None]  # with a batch and a time axis of 1
+
+  @torch.no_grad()
+  def act(self, grid) -> int:
+    """Return the next action (1-4) for the current grid; make a new plan when the old one is used up."""
+    if not self.queue:
+      count = len(self.sequences)
+      info = {name: value.unsqueeze(1).expand(1, count, *value.shape[1:]) for name, value in (("pixels", self.pixels(grid)), ("goal", self.goal), ("action", self.dummy_action))}  # the same start for every sequence, as CategoricalCEMSolver passes it
+      self.model.get_cost(info, self.candidates)  # imagines every sequence at once; fills info["predicted_emb"] and info["goal_emb"]
+      distance = (info["predicted_emb"][:, :, 1:] - info["goal_emb"][:, None, -1:]).square().sum(dim=-1)[0]  # distance to the goal after move 1, 2, ...  [4^horizon, horizon]
+      cost = distance.min(dim=-1).values if self.cost_on == "path" else distance[:, -1]
+      by_end = torch.argsort(distance[:, -1], stable=True)  # equal costs go to the sequence that ends closer to the goal, then to the first one
+      best = by_end[torch.argsort(cost[by_end], stable=True)[0]]
+      self.queue = [int(action) + 1 for action in self.sequences[best, :self.replan_every]]  # moves 0-3 -> ACTION1-4
     return self.queue.pop(0)
 
 
