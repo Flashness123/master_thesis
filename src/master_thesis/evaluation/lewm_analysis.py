@@ -19,6 +19,10 @@
 │ multi_step_rollout                                  │ state + 2 before it + 10 actions + 10 states after   │ windows            │
 ├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
 │ cem_planning                                        │ whole solutions                                      │ its own episodes   │
+├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
+│ d_jepa_planning (only with --d-jepa)                │ whole solutions of the unseen levels                 │ its own episodes   │
+├─────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┼────────────────────┤
+│ test_time_training (only with --ttt)                │ unseen states, windows, outcomes + random play       │ states, windows    │
 └─────────────────────────────────────────────────────┴──────────────────────────────────────────────────────┴────────────────────┘
 
 Every experiment runs on three groups of episodes ("splits"), so we can see whether the model only remembers what it
@@ -58,12 +62,15 @@ The experiments, in the groups the dashboard will show:
     one_step_prediction     the next state from one frame and the action, compared with "nothing changes"
   planning: can the model steer the game?
     cem_planning            reach goal states and follow a recorded solution with CEM in the real game
-                            (ExhaustivePlanner, which tries every action sequence, exists but no experiment uses it yet)
+                            (ExhaustivePlanner, which tries every action sequence, plans in d_jepa_planning and test_time_training)
+    d_jepa_planning         only with --d-jepa: does D-JEPA's ranker help the planner through the unseen levels?
     action_ranking          does the predictor rank the actions towards a goal like the real game does?
   generalization: what changes between known and new data?
     split_gaps              for every metric: seen_val minus seen_train, and unseen minus seen_val
     state_probes            its results on the unseen levels (zero-shot and fine-tuned) belong to this group
     action_decoding         its results on the unseen levels (zero-shot and fine-tuned) belong to this group
+    test_time_training      only with --ttt: how much does test-time training (training/jepa_ttt.py) improve the model
+                            in a new level, and does it learn a mechanic it has never seen (changers moving on tracks)?
 Every metric row carries its group, so the dashboard can sort them without knowing the experiments.
 
 How a step changed the grid is sorted into three kinds (classify_change):
@@ -84,6 +91,7 @@ Files, below $STABLEWM_HOME/evaluation/ls20/lewm_analysis/<checkpoint>/ (overwri
 Usage:
   python -m master_thesis.evaluation.lewm_analysis --checkpoint <run>/weights.pt --unseen syn1000_unseen
   python -m master_thesis.evaluation.lewm_analysis --checkpoint <run>/checkpoints/weights_step100000.pt --compare-to <other run>/weights.pt --unseen syn1000_unseen
+  python -m master_thesis.evaluation.lewm_analysis --checkpoint <run>/weights.pt --unseen syn1000_unseen human_l1-7:5,6,7 --ttt
 """
 
 from __future__ import annotations
@@ -94,7 +102,7 @@ import itertools
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from multiprocessing import get_context
 from pathlib import Path
@@ -144,15 +152,21 @@ EXPERIMENT_PARAMETERS = {"full": {
   "topk": 30,                   # CEM: how many of the best sequences the next round learns from
   "replan_every": 5,            # actions of a plan played before planning again
   "cost_on": "path",            # score a plan by its closest imagined point to the goal ("path") or its last imagined state ("end")
+  "distance": "latent",         # ExhaustivePlanner: how far an imagined state is from the goal: the squared latent distance ("latent") or D^2 of the facts its fact heads read ("facts", only for runs with extensions.fact_heads)
+  "fact_weights": {"position": 1.0, "energy": 0.01, "refill": 4.0, "shape": 4.0, "rotation": 4.0},  # D^2 = position |dp|^2 + energy de^2 + refill P(refills differ) + shape P(shape differs) + rotation E[d_rot^2]
+  # test_time_training (only with --ttt)
+  "ttt_play_moves": [250, 1000],  # random moves played in a level before measuring again (0 = the trained model is always measured too)
+  "ttt_action_encoder": False,  # also train the action encoder at test time, as the paper does (training/jepa_ttt.py explains why not by default)
+  "ttt_planner": "exhaustive",  # planner of its waypoint runs: "exhaustive" (ExhaustivePlanner, with and without a --d-jepa ranker) or "cem" (CemPlanner, no ranker)
 }}
 EXPERIMENT_PARAMETERS["smoke"] = {**EXPERIMENT_PARAMETERS["full"], "seen_levels": 10, "states_per_level": 30, "windows_per_level": 20, "probe_steps": 50, "probe_adapt_steps": 10,
-                                  "planning_levels": 1, "goal_steps": [5], "samples": 20, "iterations": 2, "topk": 5}
+                                  "planning_levels": 1, "goal_steps": [5], "samples": 20, "iterations": 2, "topk": 5, "ttt_play_moves": [100]}
 
 # The dashboard's groups and the experiments in them. state_probes appears twice: its seen-level results belong to
 # encoder, its unseen-level results to generalization.
 DASHBOARD_GROUPS = {"encoder": ("latent_variance", "state_probes", "action_decoding", "state_aliasing", "latent_maps", "checkpoint_similarity"),
                     "predictor": ("counterfactual_actions", "multi_step_rollout"), "world_model": ("one_step_prediction",),
-                    "planning": ("cem_planning", "action_ranking"), "generalization": ("state_probes", "action_decoding", "split_gaps")}
+                    "planning": ("cem_planning", "d_jepa_planning", "action_ranking"), "generalization": ("state_probes", "action_decoding", "split_gaps", "test_time_training")}
 
 
 ##########################
@@ -191,13 +205,15 @@ def read_game_state(game):
   goal_key = (game.ldxlnycps[goal], game.yjdexjsoa[goal], game.ehwheiwsk[goal]) if goal is not None else (-1, -1, -1)
   refills = [cell(sprite, -1, -1) for sprite in game.current_level.get_sprites_by_tag(REFILL)]  # a refill sits 1 pixel inside its cell; taken ones are removed from the level
   rotators = [cell(sprite) for sprite in game.current_level.get_sprites_by_tag(ROTATOR)]
+  movers = [cell(mover._sprite) for mover in game.wsoslqeku]  # changers moving on tracks (real levels 5-7), in the game's own list, so the first one is the same changer in every state of a level
 
   return {"level": game._current_level_index + 1, "player_x": player[0], "player_y": player[1], "energy": int(game._step_counter_ui.current_steps), "lives": int(game.aqygnziho),
           "key_shape": key[0], "key_color": key[1], "key_rotation": key[2],
           "goal_x": goal_cell[0], "goal_y": goal_cell[1], "goal_shape": goal_key[0], "goal_color": goal_key[1], "goal_rotation": goal_key[2],
           "goal_distance": distance(goal_cell) if goal is not None else -1, "key_matches_goal": int(goal is not None and key == goal_key),
           "refills_left": len(refills), "refill_x": nearest(refills)[0], "refill_y": nearest(refills)[1],
-          "rotator_present": int(bool(rotators)), "rotator_x": nearest(rotators)[0], "rotator_y": nearest(rotators)[1]}
+          "rotator_present": int(bool(rotators)), "rotator_x": nearest(rotators)[0], "rotator_y": nearest(rotators)[1],
+          "mover_x": movers[0][0] if movers else -1, "mover_y": movers[0][1] if movers else -1}
 
 
 def classify_change(before, after):
@@ -273,7 +289,8 @@ def replay_episodes_of_level(task):
           result["outcomes"].append({"action": action, "dx": dx, "dy": dy, "d_shape": 0 if reset else (after["key_shape"] - before["key_shape"]) % 6,
                                      "d_color": 0 if reset else (after["key_color"] - before["key_color"]) % 4, "d_rotation": 0 if reset else (after["key_rotation"] - before["key_rotation"]) % 4,
                                      "refill_taken": int(not reset and after["refills_left"] < before["refills_left"]), "life_lost": int(life_lost), "completed": int(completed),
-                                     "success": int(completed or (not life_lost and (dx, dy) != (0, 0))), "change": str(classify_change(grid, row[-1]))})
+                                     "success": int(completed or (not life_lost and (dx, dy) != (0, 0))), "change": str(classify_change(grid, row[-1])),
+                                     "mover_x": after["mover_x"], "mover_y": after["mover_y"]})  # where the first moving changer is after the move (test_time_training)
         result["labels"].append(before)
         result["outcome_grids"].append(np.stack(row))
       if step + 1 < len(grids):  # follow the recording up to the last grid we need
@@ -313,7 +330,7 @@ def load_checkpoint(checkpoint: str, device: str):
           "img_size": int(config.img_size), "history_size": history_size,
           "dataset": str(config.data.dataset), "frameskip": int(config.data.frameskip), "window": int(OmegaConf.select(config, "loss.rollout.context", default=1)) + int(config.wm.num_preds) if rollout_loss else history_size + 1,  # as training/lewm.py build_dataset; runs before 24.10.26 started their rollout from 1 real frame
           "seed": int(config.seed), "train_split": float(config.train_split), "val_split": float(config.val_split),
-          "started": datetime.fromtimestamp((folder / "train_config.yaml").stat().st_mtime).isoformat(timespec="seconds")}
+          "started": datetime.fromtimestamp((folder / "train_config.yaml").stat().st_mtime).isoformat(timespec="seconds"), "train_config": str(folder / "train_config.yaml")}
   return model, info
 
 
@@ -732,12 +749,21 @@ class ExhaustivePlanner:
   so this only works for few actions and short horizons.
   Equal costs (e.g. sequences that differ only after their closest approach to the goal) go to the sequence that ends
   closer to the goal, then to the first one in the enumeration.
+  With a D-JEPA ranker (models/lewm/d_jepa.py, fitted by training/d_jepa.py on this checkpoint) the cheapest sequence is
+  not played directly: select_candidates keeps 63 of them in cost order, the ranker corrects their scores from how
+  close each one's imagined path gets to the goal, and the gate takes its choice only where it is confident enough
+  (else the cheapest stays), exactly as the ranker was fitted.
+  With distance "facts" (only for a run trained with fact heads) an imagined state's distance to the goal is not the
+  squared latent distance but D^2 of the facts the heads read from both latents: the player's expected cells, the energy,
+  the probability that refills left or key shape differ and the expected squared quarter turns between the rotations,
+  weighted by fact_weights. The moving changer and everything else outside these facts then cost nothing.
   """
 
-  def __init__(self, model, img_size: int, goal_grid, parameters):
+  def __init__(self, model, img_size: int, goal_grid, parameters, ranker=None):
     from master_thesis.training.lewm import ArcGridToPixels
 
-    self.model, self.device, self.cost_on = model, parameters.device, parameters.cost_on
+    self.model, self.device, self.cost_on, self.ranker = model, parameters.device, parameters.cost_on, ranker  # ranker: None or {"module", "tau", "lowest", "total"} (main loads it)
+    self.distance, self.fact_weights = getattr(parameters, "distance", "latent"), getattr(parameters, "fact_weights", None)  # scripts that build their own parameters may leave them out
     self.replan_every = min(parameters.replan_every, parameters.horizon)
     self.to_pixels = ArcGridToPixels(img_size)
     self.goal = self.pixels(goal_grid)
@@ -757,9 +783,29 @@ class ExhaustivePlanner:
       info = {name: value.unsqueeze(1).expand(1, count, *value.shape[1:]) for name, value in (("pixels", self.pixels(grid)), ("goal", self.goal), ("action", self.dummy_action))}  # the same start for every sequence, as CategoricalCEMSolver passes it
       self.model.get_cost(info, self.candidates)  # imagines every sequence at once; fills info["predicted_emb"] and info["goal_emb"]
       distance = (info["predicted_emb"][:, :, 1:] - info["goal_emb"][:, None, -1:]).square().sum(dim=-1)[0]  # distance to the goal after move 1, 2, ...  [4^horizon, horizon]
+      if self.distance == "facts":  # D^2 of the facts the heads read from the imagined latents [4^horizon, horizon] and from the goal latent
+        imagined, goal, weights = self.model.decode_facts(info["predicted_emb"][0, :, 1:]), self.model.decode_facts(info["goal_emb"][0, -1]), self.fact_weights
+        probabilities = lambda heads, name: heads[name].float().softmax(dim=-1)
+        cell = lambda heads, name: (probabilities(heads, name) * torch.arange(heads[name].shape[-1], device=self.device)).sum(dim=-1)  # the expected cell
+        differ = lambda name: 1 - (probabilities(imagined, name) * probabilities(goal, name)).sum(dim=-1)  # the probability that the two values differ
+        turns = torch.arange(4, device=self.device)
+        turns = torch.minimum((turns[:, None] - turns[None, :]).abs(), 4 - (turns[:, None] - turns[None, :]).abs()).float().pow(2)  # squared quarter turns between two rotations [4, 4]
+        distance = (weights["position"] * ((cell(imagined, "player_x") - cell(goal, "player_x")).pow(2) + (cell(imagined, "player_y") - cell(goal, "player_y")).pow(2))
+                    + weights["energy"] * (imagined["energy"].float() - goal["energy"].float()).pow(2) + weights["refill"] * differ("refills_left") + weights["shape"] * differ("key_shape")
+                    + weights["rotation"] * torch.einsum("...k,kl,l->...", probabilities(imagined, "key_rotation"), turns, probabilities(goal, "key_rotation")))
       cost = distance.min(dim=-1).values if self.cost_on == "path" else distance[:, -1]
       by_end = torch.argsort(distance[:, -1], stable=True)  # equal costs go to the sequence that ends closer to the goal, then to the first one
-      best = by_end[torch.argsort(cost[by_end], stable=True)[0]]
+      order = by_end[torch.argsort(cost[by_end], stable=True)]  # every sequence, cheapest first
+      best = order[0]
+      if self.ranker is not None:  # D-JEPA: the ranker reorders 63 of them, the gate decides, as in training/d_jepa.py
+        from master_thesis.models.lewm.d_jepa import gate_choice, select_candidates
+
+        kept = select_candidates(order, self.ranker["lowest"], self.ranker["total"])  # cheapest first: position / (K - 1) is the base score
+        step = distance[kept].argmin(dim=-1) if self.cost_on == "path" else torch.full((len(kept),), distance.shape[1] - 1, device=self.device)  # where each kept sequence gets closest to the goal
+        closest = info["predicted_emb"][0, :, 1:][kept, step]  # its imagined latent there  [K, D]
+        base = torch.arange(len(kept), device=self.device, dtype=torch.float32) / (len(kept) - 1)
+        scores, _ = self.ranker["module"](closest[None], info["goal_emb"][0, -1][None], base[None])
+        best = kept[gate_choice(base[None], scores, self.ranker["tau"])[0]]
       self.queue = [int(action) + 1 for action in self.sequences[best, :self.replan_every]]  # moves 0-3 -> ACTION1-4
     return self.queue.pop(0)
 
@@ -1243,6 +1289,62 @@ def multi_step_rollout(context: AnalysisContext, split: str):
 #####################################
 
 
+def level_solution(context: AnalysisContext, split: str, level: int, games: dict):
+  """
+  A recorded solution to plan along in a level: a successful episode of the split that starts at the level start, so
+  planning can start at the same place (a recording that starts inside the level, e.g. a walk run, cannot be used; at
+  most 10 random ones are tried). games keeps one game per game id. Returns (game, the solution's grids) or None.
+  """
+  from master_thesis.environments.arc_collection import reset_at_level
+  from master_thesis.environments.arc_levelgen import make_game
+
+  episodes, versions = context.episodes[split]
+  candidates = episodes[episodes.success & (episodes.level == level)]
+  for row in candidates.iloc[np.random.default_rng([context.parameters.seed, SPLITS.index(split), level, 3]).permutation(len(candidates))[:10]].itertuples(index=False):
+    solution, _, game_ids = read_recorded_rows(row.dataset, versions[row.dataset], np.arange(row.offset, row.offset + row.length))  # its last grid completes the level
+    if game_ids[0] not in games:
+      games[game_ids[0]] = make_game(game_ids[0])
+    if np.array_equal(solution[0], np.asarray(reset_at_level(games[game_ids[0]], level).frame[-1], dtype=np.uint8).reshape(-1)):
+      return games[game_ids[0]], solution
+  return None
+
+
+def plan_level(env, level: int, solution, make_planner, parameters, goals: bool = True):
+  """
+  cem_planning's attempts in one level, each from the level start: one per goal distance (the recorded state goal_steps
+  after the start, with 3 x goal_steps actions; left out with goals=False) and one along the waypoints (every
+  waypoint_every-th recorded state and the final one, 3 x waypoint_every actions for each, stopping at the first one
+  missed). make_planner(goal grid) gives a fresh planner for every target. Returns one dict per attempt: level, kind,
+  goal_steps, targets, reached, steps, completed.
+  """
+  from arcengine import GameAction, GameState
+
+  from master_thesis.environments.arc_collection import reset_at_level
+
+  def play_towards(targets, budget):  # from the level start, plan towards each target in turn, with at most `budget` actions per target
+    observation = reset_at_level(env, level)
+    grid = np.asarray(observation.frame[-1], dtype=np.uint8).reshape(-1)
+    played, reached = 0, 0
+    for target in targets:
+      planner, steps = make_planner(target), 0
+      while classify_change(grid, target) == "mechanics" and steps < budget and observation.state not in (GameState.GAME_OVER, GameState.WIN):
+        observation = env.step(GameAction.from_id(planner.act(grid)))
+        grid = np.asarray(observation.frame[-1], dtype=np.uint8).reshape(-1)
+        steps += 1
+      played += steps
+      if classify_change(grid, target) == "mechanics":  # missed this target: stop
+        break
+      reached += 1
+    return {"reached": reached, "steps": played, "completed": bool(observation.levels_completed >= 1 or observation.state == GameState.WIN)}
+
+  attempts = [{"level": level, "kind": "goal", "goal_steps": goal_steps, "targets": 1, **play_towards([solution[goal_steps]], 3 * goal_steps)} for goal_steps in parameters.goal_steps if goals and goal_steps < len(solution)]
+  waypoints = list(solution[parameters.waypoint_every::parameters.waypoint_every])
+  if not waypoints or not np.array_equal(waypoints[-1], solution[-1]):
+    waypoints.append(solution[-1])  # the final state (level completed) is always the last waypoint
+  attempts.append({"level": level, "kind": "waypoints", "goal_steps": parameters.waypoint_every, "targets": len(waypoints), **play_towards(waypoints, 3 * parameters.waypoint_every)})
+  return attempts
+
+
 def cem_planning(context: AnalysisContext, split: str):
   """
   Can the model actually steer the game to a goal?
@@ -1251,7 +1353,7 @@ def cem_planning(context: AnalysisContext, split: str):
   start (so planning can start at the same place). For planning_levels random levels we take one such episode each;
   a recording that starts in the middle of a level (e.g. a walk run) cannot be used, at most 10 are tried per level.
   The episodes are read from the dataset directly; the training's test episodes are never among them.
-  How: CEM (CemPlanner) plans with the model, and its actions are played in the real game.
+  How: CEM (CemPlanner) plans with the model, and its actions are played in the real game (plan_level).
     goal reaching: the recorded state 5, 10 or 25 (goal_steps) steps after the start is the goal, and the planner
                    gets 3 times that many actions. Reached means the game shows the same situation as the goal; only
                    the energy bar may differ, because a path of another length to the same place also counts.
@@ -1260,53 +1362,16 @@ def cem_planning(context: AnalysisContext, split: str):
   A game over ends an attempt.
   Result: success_rate and steps per goal distance, waypoints_reached_fraction and level_completion_rate, also per level.
   """
-  from arcengine import GameAction, GameState
-
-  from master_thesis.environments.arc_collection import reset_at_level
-  from master_thesis.environments.arc_levelgen import make_game
-
-  parameters = context.parameters
-  episodes, versions = context.episodes[split]
-  successful = episodes[episodes.success]
-  levels = np.random.default_rng([parameters.seed, SPLITS.index(split), 3]).permutation(sorted(set(successful.level)))[:parameters.planning_levels]
-  games, attempts = {}, []
+  parameters, games, attempts = context.parameters, {}, []
+  episodes = context.episodes[split][0]
+  levels = np.random.default_rng([parameters.seed, SPLITS.index(split), 3]).permutation(sorted(set(episodes.level[episodes.success])))[:parameters.planning_levels]  # planning_levels random levels with a successful recording
   for level in sorted(int(level) for level in levels):
-    candidates = successful[successful.level == level]
-    episode, env = None, None
-    for row in candidates.iloc[np.random.default_rng([parameters.seed, SPLITS.index(split), level, 3]).permutation(len(candidates))[:10]].itertuples(index=False):
-      solution, _, game_ids = read_recorded_rows(row.dataset, versions[row.dataset], np.arange(row.offset, row.offset + row.length))  # its last grid completes the level
-      if game_ids[0] not in games:
-        games[game_ids[0]] = make_game(game_ids[0])
-      env = games[game_ids[0]]
-      if np.array_equal(solution[0], np.asarray(reset_at_level(env, level).frame[-1], dtype=np.uint8).reshape(-1)):
-        episode = row
-        break
-    if episode is None:
+    found = level_solution(context, split, level, games)
+    if found is None:
       print(f"cem_planning {split}: level {level} skipped (no successful episode starts at the level start)")
       continue
-
-    def play_towards(targets, budget):  # from the level start, plan towards each target in turn, with at most `budget` actions per target
-      observation = reset_at_level(env, level)
-      grid = np.asarray(observation.frame[-1], dtype=np.uint8).reshape(-1)
-      played, reached = 0, 0
-      for target in targets:
-        planner, steps = CemPlanner(context.model, context.info["img_size"], target, parameters), 0
-        while classify_change(grid, target) == "mechanics" and steps < budget and observation.state not in (GameState.GAME_OVER, GameState.WIN):
-          observation = env.step(GameAction.from_id(planner.act(grid)))
-          grid = np.asarray(observation.frame[-1], dtype=np.uint8).reshape(-1)
-          steps += 1
-        played += steps
-        if classify_change(grid, target) == "mechanics":  # missed this target: stop
-          break
-        reached += 1
-      return {"reached": reached, "steps": played, "completed": bool(observation.levels_completed >= 1 or observation.state == GameState.WIN)}
-
-    for goal_steps in (g for g in parameters.goal_steps if g < episode.length):
-      attempts.append({"level": level, "kind": "goal", "goal_steps": goal_steps, "targets": 1, **play_towards([solution[goal_steps]], 3 * goal_steps)})
-    waypoints = list(solution[parameters.waypoint_every::parameters.waypoint_every])
-    if not waypoints or not np.array_equal(waypoints[-1], solution[-1]):
-      waypoints.append(solution[-1])  # the final state (level completed) is always the last waypoint
-    attempts.append({"level": level, "kind": "waypoints", "goal_steps": parameters.waypoint_every, "targets": len(waypoints), **play_towards(waypoints, 3 * parameters.waypoint_every)})
+    env, solution = found
+    attempts += plan_level(env, level, solution, lambda target: CemPlanner(context.model, context.info["img_size"], target, parameters), parameters)
 
   if not attempts:
     return []
@@ -1318,6 +1383,38 @@ def cem_planning(context: AnalysisContext, split: str):
     rows += metric_rows_per_level("cem_planning", "steps", split, attempt.steps, attempt.level, f"goal{goal_steps}")
   rows += metric_rows_per_level("cem_planning", "waypoints_reached_fraction", split, followed.reached / followed.targets, followed.level, "waypoints")
   rows += metric_rows_per_level("cem_planning", "level_completion_rate", split, followed.completed, followed.level, "waypoints")
+  return rows
+
+
+def d_jepa_planning(context: AnalysisContext, ranker):
+  """
+  Does D-JEPA's ranker help the planner steer the game through levels it has never seen? (only with --d-jepa)
+
+  The ranker (models/lewm/d_jepa.py) was fitted on this checkpoint with labelled situations of the training levels
+  (training/d_jepa.py; its config.json has its own test on held-out training levels). Here it plays: waypoint following
+  as in cem_planning (every 5th recorded state and the final one, 3 x 5 actions for each) in every unseen level with a
+  recorded solution from the level start, once with ExhaustivePlanner alone (subset exhaustive) and once with the ranker
+  and its gate (subset exhaustive_d_jepa), along the same solution, so the two can be compared level by level.
+  Result: waypoints_reached_fraction and level_completion_rate, also per level.
+  """
+  if "unseen" not in context.sets:
+    print("d_jepa_planning: skipped (needs --unseen)")
+    return []
+  planners = {"exhaustive": None, "exhaustive_d_jepa": ranker}
+  games, attempts = {}, []
+  for level in sorted(set(context.sets["unseen"].states.level.tolist())):
+    found = level_solution(context, "unseen", level, games)
+    if found is None:
+      print(f"d_jepa_planning: level {level} skipped (no successful episode starts at the level start)")
+      continue
+    for name, planner_ranker in planners.items():
+      attempts += [{**attempt, "planner": name} for attempt in plan_level(found[0], level, found[1], lambda target: ExhaustivePlanner(context.model, context.info["img_size"], target, context.parameters, ranker=planner_ranker), context.parameters, goals=False)]
+  if not attempts:
+    return []
+  rows = []
+  for name, followed in pd.DataFrame(attempts).groupby("planner"):
+    rows += metric_rows_per_level("d_jepa_planning", "waypoints_reached_fraction", "unseen", followed.reached / followed.targets, followed.level, name)
+    rows += metric_rows_per_level("d_jepa_planning", "level_completion_rate", "unseen", followed.completed, followed.level, name)
   return rows
 
 
@@ -1383,6 +1480,168 @@ def split_gaps(metrics: list):
   return rows
 
 
+def test_time_training(context: AnalysisContext, ranker=None):
+  """
+  How much does test-time training improve the model in levels it has never seen? (only with --ttt)
+
+  JEPA-TTT (training/jepa_ttt.py) keeps training the predictor on the moves the agent plays in a level; the encoder
+  stays frozen. For every level of the unseen split a fresh TestTimeTrainer plays random moves in the level (after a
+  game over or a completed level it starts again at the level start; a lost life is part of the game and goes on), with
+  one training step every replan_every moves, as when the planner plays. After 0 moves (the trained model) and after
+  every count in ttt_play_moves, with the model as adapted so far (subset moves<N>):
+    prediction    one_step_error_ratio on the level's eval-half states, from one real frame as in one_step_prediction
+                  (also for mechanics steps only: mechanics_moves<N>), and rollout_error_ratio after 5 steps on its
+                  eval-half windows, from one real frame as in multi_step_rollout (k5_moves<N>)
+    new mechanic  only in levels with changers moving on tracks (real levels 5-7, --unseen human_l1-7:5,6,7). A probe as
+                  in state_probes learns to read the cell of the level's first moving changer from the real latents of
+                  the adapt-half states of these levels. mover_probe_error (cells, |dx| + |dy|) on the eval half, read
+                  from:
+                    the real latent of the state (subset state): does the frozen encoder show the changer at all? The
+                      same for every count, since the encoder does not change.
+                    the real latent after each of the 4 moves (subset real_outcome): the best a prediction could do
+                    the latent of the state before the move, against the changer's cell after it (subset unchanged):
+                      what a prediction that leaves the changer where it was would score
+                    the latent the predictor predicts after each of the 4 moves (subset moves<N>): does the predictor
+                      know where the changer moves?
+    planning      waypoint following as in cem_planning (waypoints_reached_fraction, level_completion_rate) in every
+                  unseen level with a recorded solution from the level start, along the same solution, with the trained
+                  model and with the model after the most moves; the model does not learn during the run, so the
+                  difference is what the random moves taught it (planning is slow, so only these two counts). Every
+                  run is played once per planner (subset <planner>_moves<N>), all on the same tasks, so they can be
+                  compared level by level:
+                    exhaustive         ExhaustivePlanner (ttt_planner "exhaustive", the default)
+                    exhaustive_d_jepa  ExhaustivePlanner with the D-JEPA ranker given with --d-jepa (fitted on the trained
+                                       model and kept frozen, also after test-time training)
+                    cem                CemPlanner instead (ttt_planner "cem"; no ranker: D-JEPA reorders a fixed set of
+                                       candidates, which CEM's changing samples are not)
+  ttt_loss is the mean loss of the last 10 updates before a count, ttt_updates the number of updates so far. The trainer
+  never plays the recorded eval-half episodes, but random play can reach the same situations.
+  """
+  from arcengine import GameAction, GameState
+
+  from master_thesis.environments.arc_collection import reset_at_level
+  from master_thesis.environments.arc_levelgen import make_game
+  from master_thesis.training.jepa_ttt import TestTimeTrainer, prediction_objective
+
+  if "unseen" not in context.sets:
+    print("test_time_training: skipped (needs --unseen)")
+    return []
+  parameters, evaluation_set, latents = context.parameters, context.sets["unseen"], context.latents["unseen"]
+  states, windows, episodes, versions = evaluation_set.states, evaluation_set.windows, *context.episodes["unseen"]
+  counts = sorted(set(parameters.ttt_play_moves) | {0})
+  objective, start = prediction_objective(context.info["train_config"]), parameters.history - 1  # start: where a window's rollout begins, as in multi_step_rollout
+  level_of, part = states.level.to_numpy(), states.part.to_numpy()
+  label = lambda key: states[f"label_{key}"].to_numpy()
+
+  # the probe for the first moving changer: trained once on the real latents of the adapt half (only levels with moving changers have labels)
+  outcome_cell = evaluation_set.outcomes.sort_values(["state", "action"])[["mover_x", "mover_y"]].to_numpy().reshape(len(states), len(ACTIONS), 2)  # the changer's cell after each move
+  has_mover, read_cell = label("mover_x") >= 0, None
+  adapt, evaluate = has_mover & (part == "adapt"), has_mover & (part == "eval")
+  if adapt.sum() >= 10 and evaluate.any():
+    mean, std = latents["state"][adapt].mean(axis=0), latents["state"][adapt].std(axis=0) + 1e-6
+    axes = []
+    for key in ("mover_x", "mover_y"):
+      center, scale = label(key)[adapt].mean(), label(key)[adapt].std() + 1e-6
+      axes.append((train_probe((latents["state"][adapt] - mean) / std, (label(key)[adapt] - center) / scale, 1, parameters.probe_steps, parameters.seed, parameters.device), center, scale))
+    read_cell = lambda inputs: np.stack([probe(torch.as_tensor((inputs - mean) / std, dtype=torch.float32, device=parameters.device))[:, 0].detach().cpu().numpy() * scale + center for probe, center, scale in axes], axis=-1)  # latents [n, D] -> cells [n, 2]
+  else:
+    print(f"test_time_training: mover probe skipped ({int(adapt.sum())} adapt-half states with a moving changer)")
+  outcome_levels = np.repeat(level_of[evaluate], len(ACTIONS))
+  known = outcome_cell[evaluate].reshape(-1, 2)[:, 0] >= 0  # after a move into the next level there is no changer
+  cell_error = lambda guess: np.abs(guess - outcome_cell[evaluate].reshape(-1, 2)).sum(axis=1)  # |dx| + |dy| per (state, move)
+  rows = []
+  if read_cell is not None:
+    rows += metric_rows_per_level("test_time_training", "mover_probe_error", "unseen", np.abs(read_cell(latents["state"][evaluate]) - np.stack([label("mover_x"), label("mover_y")], axis=1)[evaluate]).sum(axis=1), level_of[evaluate], "state")
+    rows += metric_rows_per_level("test_time_training", "mover_probe_error", "unseen", cell_error(read_cell(latents["outcome"][evaluate].reshape(-1, latents["outcome"].shape[-1])))[known], outcome_levels[known], "real_outcome")
+    rows += metric_rows_per_level("test_time_training", "mover_probe_error", "unseen", cell_error(np.repeat(read_cell(latents["state"][evaluate]), len(ACTIONS), axis=0))[known], outcome_levels[known], "unchanged")
+
+  measured = {count: {name: [] for name in ("one_step", "rollout", "mover", "training")} for count in counts}
+
+  def measure(net, trainer, level, count):
+    """Prediction, mover probe and training statistics of one level after `count` moves, with the model as adapted so far."""
+    adapted = replace(context, model=net)  # the experiments' helpers predict with context.model
+    selected = (level_of == level) & (part == "eval") & states.has_next.to_numpy()
+    if selected.any():
+      predicted = predict_next_latent(adapted, latents["state"][selected][:, None], states.action.to_numpy()[selected][:, None])
+      measured[count]["one_step"].append((((predicted - latents["next"][selected]) ** 2).mean(axis=1), ((latents["state"][selected] - latents["next"][selected]) ** 2).mean(axis=1), level_of[selected], states.next_change.to_numpy()[selected]))
+    in_level = (windows.level.to_numpy() == level) & (windows.part.to_numpy() == "eval")
+    if in_level.any():
+      frames, taken = latents["window"][in_level], evaluation_set.arrays["window_action"][in_level].astype(int)
+      with torch.no_grad():
+        predicted = net.predict_rollout(torch.as_tensor(frames[:, start:start + 1], device=parameters.device), encode_actions(adapted)[torch.as_tensor(taken[:, start:start + 5] - 1, device=parameters.device)], context.info["history_size"]).float().cpu().numpy()  # 5 steps from one real frame
+      measured[count]["rollout"].append((((predicted[:, 4] - frames[:, start + 5]) ** 2).mean(axis=1), ((frames[:, start] - frames[:, start + 5]) ** 2).mean(axis=1), np.full(in_level.sum(), level)))
+    movers = evaluate & (level_of == level)
+    if read_cell is not None and movers.any():
+      predicted = predict_next_latent(adapted, np.repeat(latents["state"][movers], len(ACTIONS), axis=0)[:, None], np.tile(ACTIONS, int(movers.sum()))[:, None])  # after each of the 4 moves, from one real frame
+      truth = outcome_cell[movers].reshape(-1, 2)
+      measured[count]["mover"].append((np.abs(read_cell(predicted) - truth).sum(axis=1)[truth[:, 0] >= 0], np.full(int((truth[:, 0] >= 0).sum()), level)))
+    if count:
+      measured[count]["training"].append((np.mean(trainer.losses[-10:]) if trainer.losses else np.nan, len(trainer.losses), level))
+
+  # the planners every waypoint run is played with: name -> make_planner(model) -> make_planner(waypoint grid)
+  if parameters.ttt_planner == "cem":
+    planners = {"cem": lambda net: lambda target: CemPlanner(net, context.info["img_size"], target, parameters)}
+    if ranker is not None:
+      print("test_time_training: --d-jepa ignored (the ranker needs ttt_planner exhaustive)")
+  else:
+    planners = {"exhaustive": lambda net: lambda target: ExhaustivePlanner(net, context.info["img_size"], target, parameters)}
+    if ranker is not None:
+      planners["exhaustive_d_jepa"] = lambda net: lambda target: ExhaustivePlanner(net, context.info["img_size"], target, parameters, ranker=ranker)
+  follow = lambda found, level, net, count: [{**attempt, "planner": name, "moves": count} for name, planner in planners.items() for attempt in plan_level(found[0], level, found[1], planner(net), parameters, goals=False)]
+
+  # every unseen level: measure and follow the waypoints, play and train, measure again after each count, follow the waypoints again
+  games, attempts = {}, []
+  for level in sorted(set(level_of.tolist())):
+    row = episodes[episodes.level == level].iloc[0]
+    game_id = read_recorded_rows(row.dataset, versions[row.dataset], [row.offset])[2][0]
+    if game_id not in games:
+      games[game_id] = make_game(game_id)
+    env, found = games[game_id], level_solution(context, "unseen", level, games)  # found: (game, solution grids) to follow, or None
+    trainer = TestTimeTrainer(context.model, context.info["img_size"], objective, train_action_encoder=parameters.ttt_action_encoder, seed=parameters.seed)
+    measure(context.model, trainer, level, 0)
+    if found is not None:
+      attempts += follow(found, level, context.model, 0)
+    rng = np.random.default_rng([parameters.seed, 5, level])
+    grid, new_attempt = np.asarray(reset_at_level(env, level).frame[-1], dtype=np.uint8).reshape(-1), True
+    for move in range(1, counts[-1] + 1):
+      action = int(rng.integers(1, len(ACTIONS) + 1))
+      observation = env.step(GameAction.from_id(action))
+      following = np.asarray(observation.frame[-1], dtype=np.uint8).reshape(-1)
+      trainer.observe(grid, action, following, new_attempt=new_attempt)
+      new_attempt = False
+      if move % parameters.replan_every == 0:  # one training step per plan
+        trainer.update()
+      if observation.state in (GameState.GAME_OVER, GameState.WIN) or observation.levels_completed >= 1:  # start the level again
+        following, new_attempt = np.asarray(reset_at_level(env, level).frame[-1], dtype=np.uint8).reshape(-1), True
+      grid = following
+      if move in counts:
+        measure(trainer.model, trainer, level, move)
+    if found is not None:
+      attempts += follow(found, level, trainer.model, counts[-1])  # the trainer does not learn during the run
+    print(f"test_time_training: level {level} done ({len(trainer.windows)} windows, {len(trainer.losses)} updates)")
+
+  for count in counts:
+    if measured[count]["one_step"]:
+      error, copy_error, levels, change = (np.concatenate(values) for values in zip(*measured[count]["one_step"]))
+      rows += metric_rows_per_level("test_time_training", "one_step_error_ratio", "unseen", error, levels, f"moves{count}", denominator=copy_error)
+      rows += metric_rows_per_level("test_time_training", "one_step_error_ratio", "unseen", error[change == "mechanics"], levels[change == "mechanics"], f"mechanics_moves{count}", denominator=copy_error[change == "mechanics"])
+    if measured[count]["rollout"]:
+      error, copy_error, levels = (np.concatenate(values) for values in zip(*measured[count]["rollout"]))
+      rows += metric_rows_per_level("test_time_training", "rollout_error_ratio", "unseen", error, levels, f"k5_moves{count}", denominator=copy_error)
+    if measured[count]["mover"]:
+      error, levels = (np.concatenate(values) for values in zip(*measured[count]["mover"]))
+      rows += metric_rows_per_level("test_time_training", "mover_probe_error", "unseen", error, levels, f"moves{count}")
+    if measured[count]["training"]:
+      loss, updates, levels = (np.array(values) for values in zip(*measured[count]["training"]))
+      rows += metric_rows_per_level("test_time_training", "ttt_loss", "unseen", loss, levels, f"moves{count}") + metric_rows_per_level("test_time_training", "ttt_updates", "unseen", updates, levels, f"moves{count}")
+  if attempts:
+    attempts = pd.DataFrame(attempts)
+    for (name, count), followed in attempts.groupby(["planner", "moves"]):
+      rows += metric_rows_per_level("test_time_training", "waypoints_reached_fraction", "unseen", followed.reached / followed.targets, followed.level, f"{name}_moves{count}")
+      rows += metric_rows_per_level("test_time_training", "level_completion_rate", "unseen", followed.completed, followed.level, f"{name}_moves{count}")
+  return rows
+
+
 ##########
 ## Main ##
 ##########
@@ -1396,13 +1655,32 @@ def main() -> None:
   parser.add_argument("--experiment-parameters", choices=list(EXPERIMENT_PARAMETERS), default="full", help="which settings of EXPERIMENT_PARAMETERS to use (smoke: tiny, only to check that everything runs)")
   parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
   parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)), help="processes that replay episodes in the game")
+  parser.add_argument("--ttt", action="store_true", help="also run test_time_training on the unseen levels (needs --unseen; add human_l1-7:5,6,7 for the moving changers)")
+  parser.add_argument("--d-jepa", type=Path, default=None, help="a D-JEPA ranker fitted on this checkpoint (training/d_jepa.py, models/d_jepa/<checkpoint id>/): runs d_jepa_planning on the unseen levels; with --ttt, test_time_training also plays with it")
+  parser.add_argument("--distance", choices=["latent", "facts"], default=None, help="ExhaustivePlanner's distance to the goal (default: EXPERIMENT_PARAMETERS); facts = D^2 of the fact heads' readings, only for runs trained with extensions.fact_heads")
   cli = parser.parse_args()
   device = cli.device if cli.device != "auto" else "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
   parameters = argparse.Namespace(**EXPERIMENT_PARAMETERS[cli.experiment_parameters], device=device, workers=cli.workers, output=evaluation_dir(GAME) / "lewm_analysis")
+  if cli.distance:
+    parameters.distance = cli.distance
   splits = ["seen_train", "seen_val", *(["unseen"] if cli.unseen else [])]
 
   model, info = load_checkpoint(cli.checkpoint, device)
   print(f"checkpoint {info['id']} on {device}: trained on {info['dataset']} (window {info['window']}, seed {info['seed']})")
+
+  # the D-JEPA ranker (--d-jepa): it must have been fitted on this checkpoint, with the planner's cost and horizon
+  ranker = None
+  if cli.d_jepa is not None:
+    from master_thesis.models.lewm.d_jepa import RelationalRanker
+
+    config = json.loads((cli.d_jepa / "config.json").read_text(encoding="utf-8"))
+    if (config["checkpoint"], config["cost_on"], config["horizon"]) != (info["id"], parameters.cost_on, parameters.horizon):
+      raise ValueError(f"--d-jepa {cli.d_jepa}: fitted on {config['checkpoint']} with cost {config['cost_on']} and horizon {config['horizon']}, "
+                       f"but this analysis has {info['id']}, {parameters.cost_on}, {parameters.horizon}")
+    module = RelationalRanker(D).to(device)
+    module.load_state_dict(torch.load(cli.d_jepa / "ranker.pt", map_location=device, weights_only=True))
+    ranker = {"module": module.eval(), "tau": float(config["tau"]), "lowest": int(config["lowest"]), "total": int(config["total"])}
+    print(f"D-JEPA ranker from {cli.d_jepa}: gate threshold {ranker['tau']:.4f}, calibration: plain planner {config['results']['calibration']['plain_planner']:.3f}, D-JEPA {config['results']['calibration']['d_jepa']:.3f}")
 
   # the seen levels we evaluate, the same for seen_train and seen_val so that their difference compares the same levels:
   # every real level (levels 1 .. NUM_REAL_LEVELS in every game version) that has training episodes, plus a random choice of the others up to seen_levels
@@ -1440,13 +1718,19 @@ def main() -> None:
       metrics += checkpoint_similarity(context, split)
   metrics += state_probes(context)  # trained once on seen_train, tested on every split
   metrics += action_decoding(context)  # the same
+  if ranker is not None:
+    metrics += d_jepa_planning(context, ranker)
+    print("d_jepa_planning: done")
+  if cli.ttt:
+    metrics += test_time_training(context, ranker)  # with a ranker it also plays with it, before and after test-time training
+    print("test_time_training: done")
   map_metrics, maps = latent_maps(context)
   metrics += map_metrics
   metrics += split_gaps(metrics)  # the differences between the splits of all metrics above
 
   folder = parameters.output / info["id"]
   folder.mkdir(parents=True, exist_ok=True)
-  results = {"checkpoint": info, "compare_to": compare_to[1] if compare_to else None, "evaluated": datetime.now().isoformat(timespec="seconds"), "unseen": cli.unseen,
+  results = {"checkpoint": info, "compare_to": compare_to[1] if compare_to else None, "evaluated": datetime.now().isoformat(timespec="seconds"), "unseen": cli.unseen, "ttt": cli.ttt, "d_jepa": str(cli.d_jepa) if ranker is not None else None,
              "experiment_parameters": {"name": cli.experiment_parameters, **{key: value for key, value in vars(parameters).items() if key != "output"}},
              "training_levels": sorted(training_levels), "seen_levels_evaluated": seen_levels, "dataset_version": version,
              "evaluation_sets": {split: {**evaluation_set.counts, "dropped": evaluation_set.dropped} for split, evaluation_set in sets.items()},

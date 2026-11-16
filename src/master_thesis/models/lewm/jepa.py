@@ -9,6 +9,11 @@ from torch import nn
 def detach_clone(v):
   return v.detach().clone() if torch.is_tensor(v) else v
 
+# Fact heads (extensions.fact_heads): the game facts read from a latent, with their number of classes (1 = a number).
+# fact_decoder.output_dim in configs/model/lewm.yaml is their sum (43). Names as environments/arc_facts.py stores them.
+FACT_HEADS = {"player_x": 12, "player_y": 12, "energy": 1, "refills_left": 8, "key_shape": 6, "key_rotation": 4}
+ENERGY_SCALE = 42.0  # a full energy bar: the energy head is trained on energy / 42, decode_facts returns game units
+
 class JEPA(nn.Module):
   """
   Joint-Embedding Predictive Architecture:
@@ -17,17 +22,20 @@ class JEPA(nn.Module):
     predictor      -- ARPredictor; causal transformer, predicts the next state latent given history+actions.
     projector      -- MLP 192->2048->192 (BatchNorm); post-processes the CLS token into the state latent.
     pred_proj      -- MLP 192->2048->192; post-processes the predictor's output.
+    action_decoder -- optional (Delta-JEPA): MLP 192->512->7, the action behind a latent difference.
+    fact_decoder   -- optional (fact heads): MLP 192->512->43, the game facts of FACT_HEADS from one latent.
 
-  Training uses only encode() + predict() 
+  Training uses only encode() + predict()
   Inference uses CEM = rollout()/criterion()/get_cost()
   """
-  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, ):
+  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, fact_decoder=None, ):
     super().__init__()
 
     self.encoder = encoder
     self.predictor = predictor
     self.action_encoder = action_encoder
     self.action_decoder = action_decoder  # Delta-JEPA's LDAD (optional): names the action behind a latent difference. None = plain LeWM, so older runs still load.
+    self.fact_decoder = fact_decoder  # fact heads (optional): read the game facts from a latent. None = no fact heads, so older runs still load.
     self.projector = projector or nn.Identity()  # 192->2048->192  optional: fall back to a no-op if not configured, but they are configured by ARC config
     self.pred_proj = pred_proj or nn.Identity()  # 192->2048->192
 
@@ -85,6 +93,22 @@ class JEPA(nn.Module):
     delta = next_emb - emb  # the encoder gets this gradient: it is what shapes the transition geometry
     logits = self.action_decoder(rearrange(delta, "b t d -> (b t) d"))  # the decoder is an MLP over the feature dim, so flatten (B,T) as in predict()
     return rearrange(logits, "(b t) a -> b t a", b=emb.size(0))
+
+  def decode_facts(self, emb):
+    """
+    The fact heads: read the game facts of FACT_HEADS from latents, real (encoder) or imagined (predictor).
+
+    GETS:    emb -- latents [..., 192], any leading shape (e.g. [B, T, 192] in training, [S, K, 192] in planning).
+    DOES:    one MLP over the feature dim gives every head at once (flattened as in decode_action), split into one block
+             per fact. Training puts a loss on these outputs, so the encoder has to keep the facts readable in the latent
+             and the predictor has to carry them through its rollouts.
+    RETURNS: {fact: logits [..., classes]} for player_x, player_y, refills_left, key_shape, key_rotation, and
+             {"energy": [...]} in game units (0 = empty, 42 = full).
+    """
+    outputs = self.fact_decoder(emb.reshape(-1, emb.size(-1))).reshape(*emb.shape[:-1], -1)  # [..., 43]
+    heads = dict(zip(FACT_HEADS, outputs.split(list(FACT_HEADS.values()), dim=-1)))
+    heads["energy"] = heads["energy"].squeeze(-1) * ENERGY_SCALE
+    return heads
 
   def predict_rollout(self, emb, act_emb, history_size: int = 3):
     """

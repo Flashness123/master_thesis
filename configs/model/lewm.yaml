@@ -35,6 +35,12 @@ action_decoder:  # Delta-JEPA (arXiv:2606.31232): recovers the executed action f
   hidden_dim: 512
   output_dim: 7  # ACTION1..ACTION7 (the 7-way one-hot part of the 9-D action vector)
 
+fact_decoder:  # fact heads: reads the game facts (models/lewm/jepa.py FACT_HEADS) from one latent; built only with extensions.fact_heads (training/lewm.py drops it otherwise)
+  _target_: master_thesis.models.lewm.MLP
+  input_dim: ${embed_dim}
+  hidden_dim: 512
+  output_dim: 43  # the sum of FACT_HEADS: player x 12 + player y 12 + energy 1 + refills left 8 + key shape 6 + key rotation 4
+
 projector:
   _target_: master_thesis.models.lewm.MLP
   input_dim: ${embed_dim}

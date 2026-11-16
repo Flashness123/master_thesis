@@ -4,6 +4,7 @@ import os
 import json
 import hydra
 import lightning as pl
+import numpy as np
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
@@ -16,8 +17,10 @@ from functools import partial
 from pathlib import Path
 from PIL import Image
 from tensorboard.compat.proto.summary_pb2 import Summary
+from master_thesis.environments.arc_facts import KEY_BOX
 from master_thesis.models.lewm import SIGReg
-from master_thesis.paths import model_dir, stablewm_home, timestamp
+from master_thesis.models.lewm.jepa import ENERGY_SCALE, FACT_HEADS
+from master_thesis.paths import facts_data_dir, model_dir, stablewm_home, timestamp
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import TensorBoardLogger
 from master_thesis.evaluation.world_model_metrics import world_model_metrics
@@ -209,6 +212,41 @@ class ArcActionEncoding:  # ARC: [id, x, y] → 9-D vector (7-way one-hot + norm
 
     return torch.cat([one_hot, x_normalized.unsqueeze(-1), y_normalized.unsqueeze(-1), ], dim=-1, )  # --- assemble the 9-D vector: [7 one-hot | x/63 | y/63] ---
 
+class WindowFacts:
+  """
+  A windowed dataset with the game facts of every frame attached (extensions.fact_heads, extensions.latent_shaping).
+
+  GETS:    dataset -- the windowed Lance view of build_dataset; facts -- [rows, F] int16, one row per stored state in the
+           table's order (environments/arc_facts.py), -1 where a row has no facts; key_patches -- None or the key box
+           of every key shape, colour and rotation [6, 4, 4, 6, 6] (extensions.counterfactual_keys; main hands it to the module).
+  DOES:    behaves like the dataset (every other attribute is passed through, so the splits and the sampler work as
+           before) and adds the facts of the window's frames: the rows offsets[episode] + start, + frameskip, ...,
+           exactly the rows stable-worldmodel's Lance reader loads for that window.
+  RETURNS: windows {"pixels", "action", "grid", "facts": [T, F] int64}.
+  """
+
+  def __init__(self, dataset, facts, key_patches=None):
+    self.dataset, self.facts, self.key_patches = dataset, facts, key_patches
+
+  def __getattr__(self, name):  # clip_indices, offsets, lengths, get_col_data, ...; never for the own attributes (unpickling in the loader workers asks before they exist)
+    if name in ("dataset", "facts", "key_patches") or name.startswith("__"):
+      raise AttributeError(name)
+    return getattr(self.dataset, name)
+
+  def __len__(self):
+    return len(self.dataset)
+
+  def window_facts(self, index):
+    episode, start = self.dataset.clip_indices[index]
+    first = int(self.dataset.offsets[episode]) + start
+    return torch.as_tensor(self.facts[first:first + self.dataset.span:self.dataset.frameskip].astype(np.int64))
+
+  def __getitem__(self, index):
+    return {**self.dataset[index], "facts": self.window_facts(index)}
+
+  def __getitems__(self, indices):  # the batched read the DataLoader uses (through torch's Subset) when the dataset has one, as the Lance reader does
+    return [{**window, "facts": self.window_facts(index)} for index, window in zip(indices, self.dataset.__getitems__(indices))]
+
 def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length windows and attaches the transforms
   """
   Open one Lance dataset as overlapping fixed-length windows and wire the transforms onto it.
@@ -221,6 +259,8 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length wind
            {"grid":[T,4096], "action":[T,3], ...} BEFORE transforms, and
            {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} AFTER them.
            (T = 4 for LeWM's one-step loss, 8 with the rollout loss.) SIDE EFFECT: sets cfg.model.action_encoder.input_dim.
+           With extensions.fact_heads or extensions.latent_shaping it is wrapped in WindowFacts, which adds
+           "facts": [T, F]; SIDE EFFECT: sets cfg.data.fact_names (the F columns).
   """
   if cfg.data.type != "arc":  # the training pipeline supports ARC data only
     raise ValueError(f"Unsupported data type: {cfg.data.type!r}; expected 'arc'")
@@ -245,7 +285,29 @@ def build_dataset(cfg: DictConfig):  # opens the Lance data as fixed-length wind
   print(f"Dataset: {dataset_name}")
   print(f"Samples: {len(dataset)}")  # number of 4-state windows across ALL episodes
   print(f"Action encoder input: {action_input_dim}")
-  return dataset  # {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]}
+
+  if cfg.extensions.counterfactual_keys and not (cfg.extensions.fact_heads or cfg.extensions.latent_shaping):
+    raise ValueError("extensions.counterfactual_keys only feeds extensions.fact_heads and extensions.latent_shaping: switch one of them on")
+  if cfg.extensions.fact_heads or cfg.extensions.latent_shaping:
+    # The game facts of every row, collected once per dataset by replaying its episodes (environments/arc_facts.py, one part per array task):
+    # the Lance table stores only grids and actions. Rows no part covers, or whose replay differed from the recording, keep -1 (ignored by both losses).
+    folder = facts_data_dir(cfg.data.game, cfg.data.dataset)
+    parts = sorted(folder.glob("part*.npz"))
+    if not parts:
+      raise FileNotFoundError(f"No facts for {cfg.data.dataset} in {folder}: run python -m master_thesis.environments.arc_facts --dataset {cfg.data.dataset} first")
+    names = [json.loads(part.with_suffix(".json").read_text(encoding="utf-8"))["facts"] for part in parts]
+    if any(part_names != names[0] for part_names in names):
+      raise ValueError(f"The parts in {folder} store different facts")
+    facts = np.full((int(sum(dataset.lengths)), len(names[0])), -1, dtype=np.int16)
+    for part in parts:
+      stored = np.load(part)
+      facts[stored["rows"]] = stored["facts"]
+    print(f"Facts: {folder}, {len(parts)} parts, {(facts[:, names[0].index('level')] < 0).mean():.2%} of the rows without facts")
+    key_patches = np.load(folder / "key_patches.npz")["patches"] if cfg.extensions.counterfactual_keys else None  # written by the facts job's task 0
+    dataset = WindowFacts(dataset, facts, key_patches)
+    with open_dict(cfg):
+      cfg.data.fact_names = names[0]
+  return dataset  # {"pixels":[T,3,224,224], "action":[T,9], "grid":[T,4096]} (+ "facts":[T,F])
 
 def build_dataloaders(dataset, cfg: DictConfig):
   """
@@ -445,6 +507,9 @@ def lewm_forward(self, batch, stage, cfg, ):
              prediction -- LeWM's one-step teacher-forced MSE (extensions.one_step_loss) and/or Semigroup-JEPA's rollout loss (extensions.rollout_loss)
              SIGReg     -- on the latents, or TC-SIGReg on their window-centred version (extensions.tc_sigreg)
              action     -- Delta-JEPA's action decoder (extensions.delta_jepa)
+             facts      -- fact heads on real, imagined (and counterfactual) latents (extensions.fact_heads; batch["facts"] [B, T, F])
+             shaping    -- latent distances of frame pairs follow D^2 of their facts (extensions.latent_shaping)
+             (counterfactual frames: one per window with another key shape, for both of these; extensions.counterfactual_keys)
            Logs every term each training step, and world-model metrics once per val epoch.
   RETURNS: {"loss", one entry per term} -- spt backprops on "loss".
   """
@@ -456,6 +521,7 @@ def lewm_forward(self, batch, stage, cfg, ):
   embeddings = output["emb"]  # z0..z(T-1)   [B, T, 192]
   action_embeddings = output["act_emb"]  # e(a0)..e(a(T-1))  [B, T, 192]
   terms = {}  # every loss term: logged name -> (weight in the total loss, value)
+  imagined = []  # every prediction made below with the window frames it predicts: (latents [B, n, 192], slice of frames); the fact heads read them too
 
   # --- prediction: one-step, rollout, or both ---
   if extensions.one_step_loss:
@@ -463,6 +529,7 @@ def lewm_forward(self, batch, stage, cfg, ):
     # and predicts z1..z3, every position one step ahead. Targets NOT detached: the encoder is trained from both sides, SIGReg alone prevents collapse.
     predictions = self.model.predict(embeddings[:, :history_size], action_embeddings[:, :history_size])  # ẑ1..ẑ3  [B, 3, 192]
     terms["pred_loss"] = (cfg.loss.one_step.weight, (predictions - embeddings[:, 1:history_size + 1]).pow(2).mean())
+    imagined.append((predictions, slice(1, history_size + 1)))
   if extensions.rollout_loss:
     # Rollout loss (Semigroup-JEPA, Liu et al. 2026, arXiv:2609.10464): imagine K steps from real frames, feeding predictions back as the planner does; the predictor
     # always sees the last history_size latents, so after a few steps only its own predictions. The error at every step flows back into predictor AND encoder,
@@ -476,6 +543,7 @@ def lewm_forward(self, batch, stage, cfg, ):
     for real in range(1, context + 1):
       predictions = self.model.predict_rollout(embeddings[:, context - real:context], action_embeddings[:, context - real:context + num_preds - 1], history_size)  # [B, K, 192]
       step_errors[real] = (predictions - targets).pow(2).mean(dim=(0, 2))  # targets NOT detached, as before and as in the paper
+      imagined.append((predictions, slice(context, context + num_preds)))
     terms["rollout_pred_loss"] = (cfg.loss.rollout.weight, sum((weights / weights.sum() * errors).sum() for errors in step_errors.values()) / context)  # normalized, so the loss keeps the scale of a single-step MSE
 
   # --- SIGReg: anti-collapse ---
@@ -497,6 +565,80 @@ def lewm_forward(self, batch, stage, cfg, ):
     action_loss = F.cross_entropy(action_logits.flatten(0, 1), action_targets.flatten(), ignore_index=-1) if (action_targets >= 0).any() else action_logits.sum() * 0  # a batch without a single usable transition would give NaN
     terms["action_loss"] = (cfg.loss.action.weight, action_loss)
 
+  # --- counterfactual keys ---
+  if extensions.counterfactual_keys:
+    # One frame of every window shown again with another key shape: the recorded grid with the status bar's key box replaced by the key of a different
+    # shape in the same colour and rotation, as the game renders it (environments/arc_facts.py key_patches: they match every recorded frame). The two
+    # frames differ in nothing but the key shape, which never changes inside a training episode (no shape changers in the training levels), so these
+    # pairs are where the shape term of D^2 (latent shaping) and a shape label within one layout (fact heads) come from. No shape-change transition is
+    # added: the predictor never sees one. A frame whose box does not show its key exactly as rendered (or has no facts) gets none.
+    names, windows = cfg.data.fact_names, torch.arange(embeddings.shape[0], device=embeddings.device)
+    chosen = torch.randint(embeddings.shape[1], (embeddings.shape[0],), device=embeddings.device)  # one frame of each window  [B]
+    chosen_facts = batch["facts"][windows, chosen]  # [B, F]
+    shape, colour, rotation = (chosen_facts[:, names.index(name)].clamp(min=0) for name in ("key_shape", "key_color", "key_rotation"))
+    other_shape = (shape + torch.randint(1, self.key_patches.shape[0], shape.shape, device=shape.device)) % self.key_patches.shape[0]  # any other shape, uniformly
+    grids = batch["grid"][windows, chosen].reshape(-1, 64, 64)
+    has_counterfactual = (chosen_facts[:, names.index("level")] >= 0) & (grids[:, KEY_BOX[0], KEY_BOX[1]] == self.key_patches[shape, colour, rotation]).flatten(1).all(dim=1)  # [B]
+    counterfactual_grids = grids.clone()
+    counterfactual_grids[:, KEY_BOX[0], KEY_BOX[1]] = self.key_patches[other_shape, colour, rotation].to(grids.dtype)
+    counterfactual = self.model.encode({"pixels": self.grid_to_pixels(counterfactual_grids.reshape(-1, 64 * 64))[:, None]})["emb"][:, 0]  # its latent  [B, 192]
+    counterfactual_facts = chosen_facts.clone()
+    counterfactual_facts[:, names.index("key_shape")] = other_shape
+    counterfactual_facts[~has_counterfactual] = -1  # no facts: both losses leave it out
+
+  # --- fact heads ---
+  if extensions.fact_heads:
+    # Fact heads: name the game facts (models/lewm/jepa.py FACT_HEADS: player cell, energy, refills left, key shape, key rotation) from every real latent of
+    # the window, from every imagined one above and from the counterfactual frame, each against the facts of the frame it shows or predicts. The encoder has
+    # to keep the facts readable in the latent, and the predictor has to carry them through its rollouts, so the planner can compare imagined and goal facts
+    # (D^2 in lewm_analysis). Cross-entropy for the counted facts, squared error of energy / 42 for the energy; rows without facts are left out; the mean over the heads.
+    columns = {name: cfg.data.fact_names.index(name) for name in FACT_HEADS}
+    counterfactuals = [(counterfactual[:, None], counterfactual_facts[:, None])] if extensions.counterfactual_keys else []
+    fact_latents = torch.cat([embeddings] + [latents for latents, _ in imagined] + [latents for latents, _ in counterfactuals], dim=1)  # [B, T + imagined (+ 1), 192]
+    fact_targets = torch.cat([batch["facts"]] + [batch["facts"][:, frames] for _, frames in imagined] + [facts for _, facts in counterfactuals], dim=1)  # [B, T + imagined (+ 1), F]
+    has_facts = fact_targets[..., cfg.data.fact_names.index("level")] >= 0  # rows without facts are -1 everywhere (the level tells, since the energy itself goes below 0 on the frame it runs out)
+    heads = self.model.decode_facts(fact_latents)
+    fact_losses = []
+    for name, classes in FACT_HEADS.items():
+      target = fact_targets[..., columns[name]]
+      if classes == 1:  # the energy, a number; below 0 it shows as an empty bar
+        fact_losses.append(((heads[name].float() - target.clamp(min=0)) / ENERGY_SCALE).pow(2)[has_facts].mean() if has_facts.any() else heads[name].sum() * 0)
+      else:
+        target = target.masked_fill(~has_facts | (target >= classes), -1)  # no facts, or a value beyond the head's classes (none in ls20): ignored
+        fact_losses.append(F.cross_entropy(heads[name].flatten(0, 1).float(), target.flatten(), ignore_index=-1) if (target >= 0).any() else heads[name].sum() * 0)
+    terms["fact_loss"] = (cfg.loss.facts.weight, torch.stack(fact_losses).mean())
+
+  # --- latent shaping ---
+  if extensions.latent_shaping:
+    # Latent shaping: the squared latent distance of two frames should follow D^2 of their facts,
+    #   D^2 = w_p |dp|^2 + w_e de^2 + w_r [refills left differ] + w_s [key shape differs] + w_rot d_rot^2   (dp in cells, de in energy units, d_rot in quarter turns 0-2),
+    # so differences the planner must not miss (a refill, the key) get room in the latent instead of hiding below the prediction error.
+    # Pairs: frames of the same window that show the same level. They share walls and goals, so D^2 describes everything that differs between them.
+    # With counterfactual_keys also each counterfactual frame and its recorded original, which differ only in the key shape (D^2 = w_s).
+    # Loss: (|z_i - z_j|^2 - s D^2)^2 / m^2, with m the window pairs' mean latent distance and s = m / their mean D^2, both without gradient: TC-SIGReg keeps
+    # setting the latent's overall size, this loss only its proportions (a key-shape difference as large relative to one cell as the weights say).
+    # The mean over the window pairs plus the mean over the counterfactual pairs, so the one counterfactual pair of a window is not outweighed by its 28 others.
+    weights = cfg.loss.shaping.d2
+    column = lambda name: batch["facts"][..., cfg.data.fact_names.index(name)].float()  # [B, T]
+    pair = lambda values: values[:, :, None] - values[:, None, :]  # [B, T, T]: every frame of the window against every other
+    turns = pair(column("key_rotation")).abs() % 4
+    turns = torch.minimum(turns, 4 - turns)
+    d2 = (weights.position * (pair(column("player_x")).pow(2) + pair(column("player_y")).pow(2)) + weights.energy * pair(column("energy").clamp(min=0)).pow(2)  # energy below 0 = an empty bar
+          + weights.refill * (pair(column("refills_left")) != 0).float() + weights.shape * (pair(column("key_shape")) != 0).float() + weights.rotation * turns.pow(2))
+    distance = (embeddings[:, :, None] - embeddings[:, None, :]).float().pow(2).sum(dim=-1)  # [B, T, T]
+    level = column("level")
+    frames = embeddings.shape[1]
+    paired = torch.ones(frames, frames, dtype=torch.bool, device=embeddings.device).triu(1) & (level[:, :, None] >= 0) & (level[:, None, :] >= 0) & (pair(level) == 0)  # each pair once, both with facts, same level
+    shaping = distance.sum() * 0
+    if paired.any():
+      mean_distance = distance[paired].mean().detach()
+      scale = mean_distance / d2[paired].mean().clamp(min=1e-6).detach()
+      shaping = shaping + ((distance - scale * d2) / mean_distance).pow(2)[paired].mean()
+      if extensions.counterfactual_keys and has_counterfactual.any():
+        counterfactual_distance = (embeddings[windows, chosen] - counterfactual).float().pow(2).sum(dim=-1)  # [B]
+        shaping = shaping + ((counterfactual_distance - scale * weights.shape) / mean_distance).pow(2)[has_counterfactual].mean()
+    terms["shaping_loss"] = (cfg.loss.shaping.weight, shaping)
+
   loss = sum(weight * value for weight, value in terms.values())
 
   if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(T states)
@@ -517,6 +659,19 @@ def lewm_forward(self, batch, stage, cfg, ):
     if extensions.delta_jepa:
       valid = action_targets >= 0  # entries the action loss was computed on (everything but the end-of-episode action)
       metrics["action_accuracy"] = (action_logits.argmax(dim=-1) == action_targets)[valid].float().mean()  # share of transitions whose action is recovered from the latent difference; 1/7 = chance
+    if extensions.fact_heads:  # how well each fact is read from the real latents, the imagined ones (the planner compares imagined with real) and the counterfactual frames
+      real_end = embeddings.shape[1]
+      imagined_end = real_end + sum(latents.shape[1] for latents, _ in imagined)
+      parts = [("real", slice(0, real_end)), ("imagined", slice(real_end, imagined_end))] + ([("counterfactual", slice(imagined_end, None))] if counterfactuals else [])
+      for name, classes in FACT_HEADS.items():
+        target = fact_targets[..., columns[name]]
+        known = has_facts & (target >= 0) & (target < classes) if classes > 1 else has_facts
+        score = (heads[name].argmax(dim=-1) == target).float() if classes > 1 else (heads[name].float() - target.clamp(min=0)).abs()  # correct or not; energy: absolute error in energy units
+        kind = "accuracy" if classes > 1 else "error"
+        for part, positions in parts:
+          metrics[f"fact_{name}_{kind}_{part}"] = (score[:, positions] * known[:, positions]).sum() / known[:, positions].sum().clamp(min=1)
+    if extensions.counterfactual_keys:
+      metrics["counterfactual_share"] = has_counterfactual.float().mean()  # windows that got a counterfactual frame (should be ~1: the key box matched every recorded frame checked)
     self.log_dict({"val/loss": loss.detach(), **{f"val/{name}": value.detach() for name, (_, value) in terms.items()}, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
   return {"loss": loss, **{name: value for name, (_, value) in terms.items()}}
 
@@ -540,6 +695,9 @@ def main(cfg: DictConfig) -> None:
   if not cfg.extensions.delta_jepa:  # the action decoder only exists for Delta-JEPA; dropping it keeps model_config.json (used by planning and PPO) true to the trained model
     with open_dict(cfg):
       cfg.model.pop("action_decoder", None)
+  if not cfg.extensions.fact_heads:  # the same for the fact heads
+    with open_dict(cfg):
+      cfg.model.pop("fact_decoder", None)
   model = hydra.utils.instantiate(cfg.model, )
 
   init_weights = cfg.get("init_weights")
@@ -569,6 +727,9 @@ def main(cfg: DictConfig) -> None:
 
   optimizers = {"model_opt": {"modules": "model", "optimizer": dict(cfg.optimizer), "scheduler": {"type": "LinearWarmupCosineAnnealingLR", "warmup_steps": warmup_steps, "max_steps": total_steps, }, "interval": "step", }, }
   module = spt.Module(model=model, sigreg=SIGReg(**cfg.loss.sigreg.kwargs, ), forward=partial(lewm_forward, cfg=cfg, ), optim=optimizers, )
+  if cfg.extensions.counterfactual_keys:  # what lewm_forward needs to draw counterfactual frames on the GPU
+    module.register_buffer("key_patches", torch.as_tensor(dataset.key_patches), persistent=False)  # [shapes, colours, rotations, 6, 6]; moves with the module, not saved
+    module.grid_to_pixels = ArcGridToPixels(cfg.img_size)
 
   data_module = spt.data.DataModule(train=train_loader, val=val_loader, )
 

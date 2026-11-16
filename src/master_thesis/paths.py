@@ -7,6 +7,7 @@ $STABLEWM_HOME/
 ├── synthetic_data/<game>/<collection>/ the same for the synthetic levels (arc_levelgen): solutions + Goose branches
 ├── datasets/<game>/<dataset>.lance     converted Lance datasets (+ <dataset>.json provenance)
 ├── datasets/<game>/d_jepa_<name>/      labelled plans for D-JEPA's ranker (environments/d_jepa_collection.py)
+├── datasets/<game>/<dataset>_facts/    the game's facts (player cell, energy, key, ...) for every row of a dataset (environments/arc_facts.py)
 ├── evaluation/<game>/                  evaluation outputs, file names start with the dataset/model name
 └── models/<kind>/<run>/                everything of one trained model; kind = "lewm", "ppo" or "d_jepa"
 
@@ -62,6 +63,11 @@ def dataset_path(game_id: str, name: str) -> Path:
 def d_jepa_data_dir(game_id: str, name: str) -> Path:
   """Folder of a D-JEPA dataset: situations with the outcome of every plan (environments/d_jepa_collection.py)."""
   return stablewm_home() / "datasets" / game_folder(game_id) / f"d_jepa_{name}"  # e.g. datasets/ls20/d_jepa_syn1000
+
+
+def facts_data_dir(game_id: str, dataset: str) -> Path:
+  """Folder of the game facts of every row of a dataset (environments/arc_facts.py), read by training/lewm.py."""
+  return stablewm_home() / "datasets" / game_folder(game_id) / f"{dataset}_facts"  # e.g. datasets/ls20/syn1000_train_facts
 
 
 def evaluation_dir(game_id: str) -> Path:
