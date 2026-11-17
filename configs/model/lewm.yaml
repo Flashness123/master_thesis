@@ -39,7 +39,7 @@ fact_decoder:  # fact heads: reads the game facts (models/lewm/jepa.py FACT_HEAD
   _target_: master_thesis.models.lewm.MLP
   input_dim: ${embed_dim}
   hidden_dim: 512
-  output_dim: 43  # the sum of FACT_HEADS: player x 12 + player y 12 + energy 1 + refills left 8 + key shape 6 + key rotation 4
+  output_dim: 47  # the sum of FACT_HEADS: player x 12 + player y 12 + energy 1 + refills left 8 + key shape 6 + key rotation 4 + key colour 4 (43 without colour before 17 Nov)
 
 projector:
   _target_: master_thesis.models.lewm.MLP

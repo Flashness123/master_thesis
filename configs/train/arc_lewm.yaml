@@ -39,9 +39,9 @@ extensions:  # defaults = plain LeWM (one_step_loss only); switch on the additio
   rollout_loss: false  # Semigroup-JEPA (arXiv:2609.10464): imagine wm.num_preds steps from 1, 2, ..., loss.rollout.context real frames (false in all runs up to ls20_multi-no-l3_delta_warm300k; later runs used it instead of one_step_loss)
   tc_sigreg: false  # TC-SIGReg (arXiv:2607.26924): SIGReg on the latents minus their window mean instead of the latents (false in all runs up to ls20_multi-no-l3_220k_succ0.1_0918-1951)
   delta_jepa: false  # Delta-JEPA (arXiv:2606.31232): an action decoder names the action from z_t+1 - z_t (adds model.action_decoder and loss.action)
-  fact_heads: false  # heads name the game facts (player cell, energy, refills left, key shape, rotation) from real and imagined latents (adds model.fact_decoder and loss.facts); needs datasets/<game>/<dataset>_facts/ (environments/arc_facts.py)
+  fact_heads: false  # heads name the game facts (player cell, energy, refills left, key shape, rotation, colour) from real and imagined latents (adds model.fact_decoder and loss.facts); needs datasets/<game>/<dataset>_facts/ (environments/arc_facts.py)
   latent_shaping: false  # the squared latent distance of two frames of a window follows D^2 of their facts (loss.shaping); needs the same facts
-  counterfactual_keys: false  # with fact_heads and/or latent_shaping: one frame per window is also shown with another key shape (key_patches.npz of the facts), the only frames that differ in the key's shape alone
+  counterfactual_keys: false  # with fact_heads and/or latent_shaping: one frame per window is also shown with another key shape, colour or rotation (key_patches.npz of the facts), the only frames that differ in one key property alone
 
 wm:
   history_size: 3  # latents the predictor attends to; LeWM's one-step loss uses windows of history_size + 1 = 4 frames
@@ -100,9 +100,10 @@ loss:
     weight: 0.5  # the mean over the heads starts near 1.7 (cross-entropies of 4-12 classes) and so begins at the size of Delta-JEPA's action term (0.5 * ln 7)
   shaping:  # extensions.latent_shaping
     weight: 0.1  # its normalized squared error is about 1 for an unshaped latent, so it starts at the size of the TC-SIGReg term (0.09 * ~1.7)
-    d2:  # D^2 = position |dp|^2 + energy de^2 + refill [refills left differ] + shape [key shape differs] + rotation d_rot^2; only the proportions count
+    d2:  # D^2 = position |dp|^2 + energy de^2 + refill [refills left differ] + shape [key shape differs] + colour [key colour differs] + rotation d_rot^2; only the proportions count
       position: 1.0  # per cell^2: one move = 1
       energy: 0.01  # per energy unit^2: a move costs 1-2 units (0.01-0.04), a full refill 42 units (~18, about 4 cells)
       refill: 4.0  # a refill taken or not: as far as two cells
       shape: 4.0  # another key shape: as far as two cells
+      colour: 4.0  # another key colour: as far as two cells
       rotation: 4.0  # per quarter turn^2: one turn = two cells, a half turn (d_rot = 2) = four cells

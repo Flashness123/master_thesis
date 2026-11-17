@@ -153,7 +153,7 @@ EXPERIMENT_PARAMETERS = {"full": {
   "replan_every": 5,            # actions of a plan played before planning again
   "cost_on": "path",            # score a plan by its closest imagined point to the goal ("path") or its last imagined state ("end")
   "distance": "latent",         # ExhaustivePlanner: how far an imagined state is from the goal: the squared latent distance ("latent") or D^2 of the facts its fact heads read ("facts", only for runs with extensions.fact_heads)
-  "fact_weights": {"position": 1.0, "energy": 0.01, "refill": 4.0, "shape": 4.0, "rotation": 4.0},  # D^2 = position |dp|^2 + energy de^2 + refill P(refills differ) + shape P(shape differs) + rotation E[d_rot^2]
+  "fact_weights": {"position": 1.0, "energy": 0.01, "refill": 4.0, "shape": 4.0, "colour": 4.0, "rotation": 4.0},  # D^2 = position |dp|^2 + energy de^2 + refill P(refills differ) + shape P(shape differs) + colour P(colour differs; models with a colour head) + rotation E[d_rot^2]
   # test_time_training (only with --ttt)
   "ttt_play_moves": [250, 1000],  # random moves played in a level before measuring again (0 = the trained model is always measured too)
   "ttt_action_encoder": False,  # also train the action encoder at test time, as the paper does (training/jepa_ttt.py explains why not by default)
@@ -792,6 +792,7 @@ class ExhaustivePlanner:
         turns = torch.minimum((turns[:, None] - turns[None, :]).abs(), 4 - (turns[:, None] - turns[None, :]).abs()).float().pow(2)  # squared quarter turns between two rotations [4, 4]
         distance = (weights["position"] * ((cell(imagined, "player_x") - cell(goal, "player_x")).pow(2) + (cell(imagined, "player_y") - cell(goal, "player_y")).pow(2))
                     + weights["energy"] * (imagined["energy"].float() - goal["energy"].float()).pow(2) + weights["refill"] * differ("refills_left") + weights["shape"] * differ("key_shape")
+                    + (weights["colour"] * differ("key_color") if "key_color" in imagined else 0)  # runs before 17 Nov have no colour head
                     + weights["rotation"] * torch.einsum("...k,kl,l->...", probabilities(imagined, "key_rotation"), turns, probabilities(goal, "key_rotation")))
       cost = distance.min(dim=-1).values if self.cost_on == "path" else distance[:, -1]
       by_end = torch.argsort(distance[:, -1], stable=True)  # equal costs go to the sequence that ends closer to the goal, then to the first one

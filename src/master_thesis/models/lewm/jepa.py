@@ -10,8 +10,9 @@ def detach_clone(v):
   return v.detach().clone() if torch.is_tensor(v) else v
 
 # Fact heads (extensions.fact_heads): the game facts read from a latent, with their number of classes (1 = a number).
-# fact_decoder.output_dim in configs/model/lewm.yaml is their sum (43). Names as environments/arc_facts.py stores them.
-FACT_HEADS = {"player_x": 12, "player_y": 12, "energy": 1, "refills_left": 8, "key_shape": 6, "key_rotation": 4}
+# fact_decoder.output_dim in configs/model/lewm.yaml is their sum (47). Names as environments/arc_facts.py stores them.
+# key_color came last (17 Nov): runs before have 43 outputs and no colour head, decode_facts reads them without it.
+FACT_HEADS = {"player_x": 12, "player_y": 12, "energy": 1, "refills_left": 8, "key_shape": 6, "key_rotation": 4, "key_color": 4}
 ENERGY_SCALE = 42.0  # a full energy bar: the energy head is trained on energy / 42, decode_facts returns game units
 
 class JEPA(nn.Module):
@@ -23,7 +24,7 @@ class JEPA(nn.Module):
     projector      -- MLP 192->2048->192 (BatchNorm); post-processes the CLS token into the state latent.
     pred_proj      -- MLP 192->2048->192; post-processes the predictor's output.
     action_decoder -- optional (Delta-JEPA): MLP 192->512->7, the action behind a latent difference.
-    fact_decoder   -- optional (fact heads): MLP 192->512->43, the game facts of FACT_HEADS from one latent.
+    fact_decoder   -- optional (fact heads): MLP 192->512->47, the game facts of FACT_HEADS from one latent.
 
   Training uses only encode() + predict()
   Inference uses CEM = rollout()/criterion()/get_cost()
@@ -100,13 +101,18 @@ class JEPA(nn.Module):
 
     GETS:    emb -- latents [..., 192], any leading shape (e.g. [B, T, 192] in training, [S, K, 192] in planning).
     DOES:    one MLP over the feature dim gives every head at once (flattened as in decode_action), split into one block
-             per fact. Training puts a loss on these outputs, so the encoder has to keep the facts readable in the latent
-             and the predictor has to carry them through its rollouts.
-    RETURNS: {fact: logits [..., classes]} for player_x, player_y, refills_left, key_shape, key_rotation, and
-             {"energy": [...]} in game units (0 = empty, 42 = full).
+             per fact in FACT_HEADS order, as many as the decoder has outputs for (runs before 17 Nov: no key_color).
+             Training puts a loss on these outputs, so the encoder has to keep the facts readable in the latent and the
+             predictor has to carry them through its rollouts.
+    RETURNS: {fact: logits [..., classes]} for player_x, player_y, refills_left, key_shape, key_rotation (and key_color),
+             and {"energy": [...]} in game units (0 = empty, 42 = full).
     """
-    outputs = self.fact_decoder(emb.reshape(-1, emb.size(-1))).reshape(*emb.shape[:-1], -1)  # [..., 43]
-    heads = dict(zip(FACT_HEADS, outputs.split(list(FACT_HEADS.values()), dim=-1)))
+    outputs = self.fact_decoder(emb.reshape(-1, emb.size(-1))).reshape(*emb.shape[:-1], -1)  # [..., 47] (43 before 17 Nov)
+    heads, start = {}, 0
+    for name, size in FACT_HEADS.items():
+      if start + size > outputs.shape[-1]:
+        break
+      heads[name], start = outputs[..., start:start + size], start + size
     heads["energy"] = heads["energy"].squeeze(-1) * ENERGY_SCALE
     return heads
 

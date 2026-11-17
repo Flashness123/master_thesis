@@ -567,28 +567,34 @@ def lewm_forward(self, batch, stage, cfg, ):
 
   # --- counterfactual keys ---
   if extensions.counterfactual_keys:
-    # One frame of every window shown again with another key shape: the recorded grid with the status bar's key box replaced by the key of a different
-    # shape in the same colour and rotation, as the game renders it (environments/arc_facts.py key_patches: they match every recorded frame). The two
-    # frames differ in nothing but the key shape, which never changes inside a training episode (no shape changers in the training levels), so these
-    # pairs are where the shape term of D^2 (latent shaping) and a shape label within one layout (fact heads) come from. No shape-change transition is
-    # added: the predictor never sees one. A frame whose box does not show its key exactly as rendered (or has no facts) gets none.
+    # One frame of every window shown again with another key: the recorded grid with the status bar's key box replaced by the key with one of its shape,
+    # colour or rotation changed (chosen at random per window), as the game renders it (environments/arc_facts.py key_patches: they match every recorded
+    # frame). The two frames differ in nothing but that one property. The key shape never changes inside a training episode (no shape changers in the
+    # training levels), and colour and rotation change only together with a move, so these pairs are where the key terms of D^2 (latent shaping) and key
+    # labels within one layout (fact heads) come from cleanly. No transition is added: the predictor never sees one. A frame whose box does not show its
+    # key exactly as rendered (or has no facts) gets none.
     names, windows = cfg.data.fact_names, torch.arange(embeddings.shape[0], device=embeddings.device)
     chosen = torch.randint(embeddings.shape[1], (embeddings.shape[0],), device=embeddings.device)  # one frame of each window  [B]
     chosen_facts = batch["facts"][windows, chosen]  # [B, F]
-    shape, colour, rotation = (chosen_facts[:, names.index(name)].clamp(min=0) for name in ("key_shape", "key_color", "key_rotation"))
-    other_shape = (shape + torch.randint(1, self.key_patches.shape[0], shape.shape, device=shape.device)) % self.key_patches.shape[0]  # any other shape, uniformly
+    key = torch.stack([chosen_facts[:, names.index(name)].clamp(min=0) for name in ("key_shape", "key_color", "key_rotation")], dim=1)  # [B, 3]
+    sizes = torch.tensor(self.key_patches.shape[:3], device=key.device)  # shapes, colours, rotations (6, 4, 4)
+    changed = torch.randint(3, (key.shape[0],), device=key.device)  # which property changes: 0 shape, 1 colour, 2 rotation  [B]
+    step = torch.floor(torch.rand(key.shape[0], device=key.device) * (sizes[changed] - 1)).long() + 1  # 1 .. size - 1: any other value, uniformly
+    other_key = key.clone()
+    other_key[windows, changed] = (key[windows, changed] + step) % sizes[changed]
     grids = batch["grid"][windows, chosen].reshape(-1, 64, 64)
-    has_counterfactual = (chosen_facts[:, names.index("level")] >= 0) & (grids[:, KEY_BOX[0], KEY_BOX[1]] == self.key_patches[shape, colour, rotation]).flatten(1).all(dim=1)  # [B]
+    has_counterfactual = (chosen_facts[:, names.index("level")] >= 0) & (grids[:, KEY_BOX[0], KEY_BOX[1]] == self.key_patches[key[:, 0], key[:, 1], key[:, 2]]).flatten(1).all(dim=1)  # [B]
     counterfactual_grids = grids.clone()
-    counterfactual_grids[:, KEY_BOX[0], KEY_BOX[1]] = self.key_patches[other_shape, colour, rotation].to(grids.dtype)
+    counterfactual_grids[:, KEY_BOX[0], KEY_BOX[1]] = self.key_patches[other_key[:, 0], other_key[:, 1], other_key[:, 2]].to(grids.dtype)
     counterfactual = self.model.encode({"pixels": self.grid_to_pixels(counterfactual_grids.reshape(-1, 64 * 64))[:, None]})["emb"][:, 0]  # its latent  [B, 192]
     counterfactual_facts = chosen_facts.clone()
-    counterfactual_facts[:, names.index("key_shape")] = other_shape
+    for index, name in enumerate(("key_shape", "key_color", "key_rotation")):
+      counterfactual_facts[:, names.index(name)] = other_key[:, index]
     counterfactual_facts[~has_counterfactual] = -1  # no facts: both losses leave it out
 
   # --- fact heads ---
   if extensions.fact_heads:
-    # Fact heads: name the game facts (models/lewm/jepa.py FACT_HEADS: player cell, energy, refills left, key shape, key rotation) from every real latent of
+    # Fact heads: name the game facts (models/lewm/jepa.py FACT_HEADS: player cell, energy, refills left, key shape, rotation, colour) from every real latent of
     # the window, from every imagined one above and from the counterfactual frame, each against the facts of the frame it shows or predicts. The encoder has
     # to keep the facts readable in the latent, and the predictor has to carry them through its rollouts, so the planner can compare imagined and goal facts
     # (D^2 in lewm_analysis). Cross-entropy for the counted facts, squared error of energy / 42 for the energy; rows without facts are left out; the mean over the heads.
@@ -611,10 +617,10 @@ def lewm_forward(self, batch, stage, cfg, ):
   # --- latent shaping ---
   if extensions.latent_shaping:
     # Latent shaping: the squared latent distance of two frames should follow D^2 of their facts,
-    #   D^2 = w_p |dp|^2 + w_e de^2 + w_r [refills left differ] + w_s [key shape differs] + w_rot d_rot^2   (dp in cells, de in energy units, d_rot in quarter turns 0-2),
+    #   D^2 = w_p |dp|^2 + w_e de^2 + w_r [refills left differ] + w_s [key shape differs] + w_c [key colour differs] + w_rot d_rot^2   (dp in cells, de in energy units, d_rot in quarter turns 0-2),
     # so differences the planner must not miss (a refill, the key) get room in the latent instead of hiding below the prediction error.
     # Pairs: frames of the same window that show the same level. They share walls and goals, so D^2 describes everything that differs between them.
-    # With counterfactual_keys also each counterfactual frame and its recorded original, which differ only in the key shape (D^2 = w_s).
+    # With counterfactual_keys also each counterfactual frame and its recorded original, which differ only in one key property (D^2 = w_s, w_c or w_rot d_rot^2).
     # Loss: (|z_i - z_j|^2 - s D^2)^2 / m^2, with m the window pairs' mean latent distance and s = m / their mean D^2, both without gradient: TC-SIGReg keeps
     # setting the latent's overall size, this loss only its proportions (a key-shape difference as large relative to one cell as the weights say).
     # The mean over the window pairs plus the mean over the counterfactual pairs, so the one counterfactual pair of a window is not outweighed by its 28 others.
@@ -624,7 +630,8 @@ def lewm_forward(self, batch, stage, cfg, ):
     turns = pair(column("key_rotation")).abs() % 4
     turns = torch.minimum(turns, 4 - turns)
     d2 = (weights.position * (pair(column("player_x")).pow(2) + pair(column("player_y")).pow(2)) + weights.energy * pair(column("energy").clamp(min=0)).pow(2)  # energy below 0 = an empty bar
-          + weights.refill * (pair(column("refills_left")) != 0).float() + weights.shape * (pair(column("key_shape")) != 0).float() + weights.rotation * turns.pow(2))
+          + weights.refill * (pair(column("refills_left")) != 0).float() + weights.shape * (pair(column("key_shape")) != 0).float() + weights.colour * (pair(column("key_color")) != 0).float()
+          + weights.rotation * turns.pow(2))
     distance = (embeddings[:, :, None] - embeddings[:, None, :]).float().pow(2).sum(dim=-1)  # [B, T, T]
     level = column("level")
     frames = embeddings.shape[1]
@@ -636,7 +643,9 @@ def lewm_forward(self, batch, stage, cfg, ):
       shaping = shaping + ((distance - scale * d2) / mean_distance).pow(2)[paired].mean()
       if extensions.counterfactual_keys and has_counterfactual.any():
         counterfactual_distance = (embeddings[windows, chosen] - counterfactual).float().pow(2).sum(dim=-1)  # [B]
-        shaping = shaping + ((counterfactual_distance - scale * weights.shape) / mean_distance).pow(2)[has_counterfactual].mean()
+        counterfactual_turns = torch.minimum(step, 4 - step).float()  # for a changed rotation: quarter turns between the two (0-2)
+        counterfactual_d2 = torch.stack([torch.full_like(counterfactual_turns, weights.shape), torch.full_like(counterfactual_turns, weights.colour), weights.rotation * counterfactual_turns.pow(2)], dim=1)[windows, changed]  # [B]
+        shaping = shaping + ((counterfactual_distance - scale * counterfactual_d2) / mean_distance).pow(2)[has_counterfactual].mean()
     terms["shaping_loss"] = (cfg.loss.shaping.weight, shaping)
 
   loss = sum(weight * value for weight, value in terms.values())
