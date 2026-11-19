@@ -29,8 +29,9 @@ class JEPA(nn.Module):
   Training uses only encode() + predict()
   Inference uses CEM = rollout()/criterion()/get_cost()
   """
-  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, fact_decoder=None, ):
+  def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, fact_decoder=None, factor_decoder=None, ):
     super().__init__()
+    self.factor_decoder = factor_decoder  # factor heads (optional): the look of the screen regions found by training/factor_discovery.py. None = no factor heads.
 
     self.encoder = encoder
     self.predictor = predictor
@@ -115,6 +116,17 @@ class JEPA(nn.Module):
       heads[name], start = outputs[..., start:start + size], start + size
     heads["energy"] = heads["energy"].squeeze(-1) * ENERGY_SCALE
     return heads
+
+  def decode_factors(self, emb):
+    """
+    The factor heads: read which look every discovered screen region has (training/factor_discovery.py found the regions
+    without the game engine; each look in its codebook is a class).
+
+    GETS:    emb -- latents [..., 192], real or imagined.
+    DOES:    one MLP over the feature dim, flattened as in decode_facts.
+    RETURNS: logits [..., sum of the codebook sizes]; training/lewm.py splits them per region (cfg.factors.sizes).
+    """
+    return self.factor_decoder(emb.reshape(-1, emb.size(-1))).reshape(*emb.shape[:-1], -1)
 
   def predict_rollout(self, emb, act_emb, history_size: int = 3):
     """

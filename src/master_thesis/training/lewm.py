@@ -492,6 +492,46 @@ def build_arc_sampler(dataset, train_indices, success_probability_sampling, seed
 
   return torch.utils.data.WeightedRandomSampler(weights=weights, num_samples=len(train_indices), replacement=True, generator=torch.Generator().manual_seed(seed), )
 
+def region_codes(grids, boxes, books):
+  """
+  GETS:    grids [N, 64, 64] colour indices; boxes -- per discovered region [row0, row1, col0, col1] (end excluded);
+           books -- per region its looks [K, rows, columns] (training/factor_discovery.py).
+  DOES:    compares each region's pixels with every look of its codebook.
+  RETURNS: codes [N, regions] long: the matching look, -1 = a look not in the codebook.
+  """
+  codes = []
+  for (row0, row1, col0, col1), book in zip(boxes, books):
+    match = (grids[:, None, row0:row1, col0:col1] == book[None].to(grids.dtype)).flatten(2).all(dim=-1)  # [N, looks]
+    codes.append(torch.where(match.any(dim=-1), match.float().argmax(dim=-1), torch.full((len(grids),), -1, device=grids.device, dtype=torch.long)))
+  return torch.stack(codes, dim=-1)
+
+def object_occupancy(grids, colours, shapes):
+  """
+  GETS:    grids [N, 64, 64] colour indices; colours -- per discovered object family its colour; shapes -- per family its
+           exact shapes, [height, width] masks (1 = the object's pixels; training/factor_discovery.py --objects).
+  DOES:    an object of a family sits where every pixel of one of its shapes has the family's colour and none of the pixels
+           next to the shape (4-neighbourhood) has it: exactly a connected area of that shape, as discovery found them.
+           Found by two convolutions per shape (outside the grid counts as another colour).
+  RETURNS: (occupancy [N, families, 256] float: which 4x4 patches of the grid hold an object's top-left pixel,
+            pixels [N, families, 64, 64] bool: the pixels of the objects found).
+  """
+  plus = torch.tensor([[0., 1., 0.], [1., 1., 1.], [0., 1., 0.]], device=grids.device)[None, None]
+  occupancy, pixels = [], []
+  with torch.autocast(device_type=grids.device.type, enabled=False):  # exact counts
+    for colour, family in zip(colours, shapes):
+      is_colour = F.pad((grids == colour).float()[:, None], (1, 1, 1, 1))  # [N, 1, 66, 66]
+      starts, covered = torch.zeros(len(grids), 64, 64, device=grids.device), torch.zeros(len(grids), 64, 64, device=grids.device)
+      for shape in family:
+        inside = F.pad(shape.float(), (1, 1, 1, 1))[None, None]  # [1, 1, h + 2, w + 2]
+        border = (F.conv2d(inside, plus, padding=1) > 0).float() - inside  # the pixels next to the shape
+        match = ((F.conv2d(is_colour, inside).round() == inside.sum()) & (F.conv2d(is_colour, border).round() == 0)).float()  # [N, 1, 65 - h, 65 - w]: position = the shape's top-left pixel (rounded: batched convolutions are not exact)
+        rows, columns = match.shape[2], match.shape[3]
+        starts[:, :rows, :columns] = torch.maximum(starts[:, :rows, :columns], match[:, 0])
+        covered = torch.maximum(covered, F.conv_transpose2d(match, shape.float()[None, None])[:, 0].clamp(max=1))  # the shape stamped at every match: [N, 64, 64]
+      occupancy.append(F.max_pool2d(starts[:, None], 4)[:, 0].flatten(1))
+      pixels.append(covered > 0)
+  return torch.stack(occupancy, dim=1), torch.stack(pixels, dim=1)
+
 def lewm_forward(self, batch, stage, cfg, ):
   """
   The training/validation step: LeWM, plus the additions from later papers switched on in cfg.extensions.
@@ -510,6 +550,8 @@ def lewm_forward(self, batch, stage, cfg, ):
              facts      -- fact heads on real, imagined (and counterfactual) latents (extensions.fact_heads; batch["facts"] [B, T, F])
              shaping    -- latent distances of frame pairs follow D^2 of their facts (extensions.latent_shaping)
              (counterfactual frames: one per window with another key shape, for both of these; extensions.counterfactual_keys)
+             factors    -- discovered regions' looks and object families' places (extensions.factor_heads / object_heads, training/factor_discovery.py),
+                           with counterfactual frames (extensions.counterfactual_factors / counterfactual_objects)
            Logs every term each training step, and world-model metrics once per val epoch.
   RETURNS: {"loss", one entry per term} -- spt backprops on "loss".
   """
@@ -648,6 +690,69 @@ def lewm_forward(self, batch, stage, cfg, ):
         shaping = shaping + ((counterfactual_distance - scale * counterfactual_d2) / mean_distance).pow(2)[has_counterfactual].mean()
     terms["shaping_loss"] = (cfg.loss.shaping.weight, shaping)
 
+  # --- discovered factors: regions and object families ---
+  if extensions.factor_heads or extensions.object_heads:
+    # The factors found by training/factor_discovery.py (from the latent's blind spots, without the game engine and without anyone naming what
+    # matters), read straight from the grid of each frame:
+    #   factor heads  the look of every fixed screen region (region_codes; -1 = a look not in its codebook, left out)
+    #   object heads  where the objects of every family are (object_occupancy: which 4x4 patches hold one), so the latent keeps how many there are
+    #                 and where (refills, goal symbols, pushers, lives, ...)
+    # From real latents, every imagined one above (against the frame it predicts) and the counterfactual frames: with counterfactual_factors one
+    # frame per window shows another look of one region from its codebook, with counterfactual_objects one frame per window shows one object
+    # family removed (its pixels get the frame's most common colour, the floor). Their targets are read from the changed frame; no transition is added.
+    window_grids = batch["grid"].reshape(*batch["grid"].shape[:2], 64, 64)  # [B, T, 64, 64]
+    batch_size, window_frames = window_grids.shape[:2]
+    windows = torch.arange(batch_size, device=window_grids.device)
+    books = [getattr(self, f"factor_codebook_{index}") for index in range(len(cfg.factors.boxes))] if extensions.factor_heads else []
+    shapes = [[getattr(self, f"object_template_{family}_{index}") for index in range(count)] for family, count in enumerate(cfg.factors.object_templates)] if extensions.object_heads else []
+    flat = window_grids.flatten(0, 1)
+    factor_latents, region_targets, object_targets = [embeddings] + [latents for latents, _ in imagined], [], []
+    if books:
+      codes = region_codes(flat, cfg.factors.boxes, books).unflatten(0, (batch_size, window_frames))  # [B, T, regions]
+      region_targets = [codes] + [codes[:, frames] for _, frames in imagined]
+    if shapes:
+      occupancy, object_pixels = object_occupancy(flat, cfg.factors.object_colours, shapes)
+      occupancy, object_pixels = occupancy.unflatten(0, (batch_size, window_frames)), object_pixels.unflatten(0, (batch_size, window_frames))  # [B, T, families, 256], [B, T, families, 64, 64]
+      object_targets = [occupancy] + [occupancy[:, frames] for _, frames in imagined]
+    changed_grids = []  # the counterfactual frames, one per window each  [B, 64, 64]
+    if extensions.counterfactual_factors:
+      chosen = torch.randint(window_frames, (batch_size,), device=window_grids.device)
+      region = torch.randint(len(books), (batch_size,), device=window_grids.device)
+      sizes = torch.tensor(list(cfg.factors.sizes), device=window_grids.device)
+      current = codes[windows, chosen][windows, region]
+      other = (current.clamp(min=0) + torch.floor(torch.rand(batch_size, device=window_grids.device) * (sizes[region] - 1)).long() + 1) % sizes[region]  # any other look, uniformly
+      grid = window_grids[windows, chosen].clone()
+      for index, ((row0, row1, col0, col1), book) in enumerate(zip(cfg.factors.boxes, books)):
+        pasted = (current >= 0) & (region == index)  # only where the region shows a look from its codebook
+        grid[pasted, row0:row1, col0:col1] = book[other[pasted]].to(grid.dtype)
+      changed_grids.append(grid)
+    if extensions.counterfactual_objects:
+      chosen = torch.randint(window_frames, (batch_size,), device=window_grids.device)
+      present = occupancy[windows, chosen].amax(dim=-1)  # [B, families]: 1 where the frame has an object of the family
+      family = torch.multinomial(present + 1e-6, 1)[:, 0]  # a family present in the frame (any, if none is)
+      grid = window_grids[windows, chosen]
+      floor = torch.mode(grid.flatten(1).long(), dim=1).values  # the frame's most common colour
+      changed_grids.append(torch.where(object_pixels[windows, chosen, family], floor[:, None, None].to(grid.dtype), grid))
+    for grid in changed_grids:
+      factor_latents.append(self.model.encode({"pixels": self.grid_to_pixels(grid.reshape(-1, 64 * 64))[:, None]})["emb"])  # [B, 1, 192]
+      if books:
+        region_targets.append(region_codes(grid, cfg.factors.boxes, books)[:, None])
+      if shapes:
+        object_targets.append(object_occupancy(grid, cfg.factors.object_colours, shapes)[0][:, None])
+    outputs = self.model.decode_factors(torch.cat(factor_latents, dim=1))  # [B, N, sum of the looks + 256 per family]
+    looks = sum(cfg.factors.sizes)
+    if books:
+      region_logits = outputs[..., :looks].split(list(cfg.factors.sizes), dim=-1)  # per region [B, N, looks]
+      all_codes = torch.cat(region_targets, dim=1)  # [B, N, regions]
+      factor_losses = [F.cross_entropy(logits.flatten(0, 1).float(), all_codes[..., index].flatten(), ignore_index=-1) if (all_codes[..., index] >= 0).any() else logits.sum() * 0
+                       for index, logits in enumerate(region_logits)]
+      terms["factor_loss"] = (cfg.loss.factors.weight, torch.stack(factor_losses).mean())
+    if shapes:
+      object_logits = outputs[..., looks:].unflatten(-1, (len(shapes), 256))  # [B, N, families, 256]
+      all_occupancy = torch.cat(object_targets, dim=1)
+      # occupied patches are rare (a few of 256), so a found object counts 10 times as much as an empty patch
+      terms["object_loss"] = (cfg.loss.objects.weight, F.binary_cross_entropy_with_logits(object_logits.float(), all_occupancy, pos_weight=torch.tensor(10.0, device=object_logits.device)))
+
   loss = sum(weight * value for weight, value in terms.values())
 
   if self.training:  # training: one value per step, no epoch averages (epochs are short when training by steps) | Now: run(max_epochs)  ⊃  epochs(one training set)  ⊃  steps(batch of windows)  ⊃  windows(T states)
@@ -681,6 +786,22 @@ def lewm_forward(self, batch, stage, cfg, ):
           metrics[f"fact_{name}_{kind}_{part}"] = (score[:, positions] * known[:, positions]).sum() / known[:, positions].sum().clamp(min=1)
     if extensions.counterfactual_keys:
       metrics["counterfactual_share"] = has_counterfactual.float().mean()  # windows that got a counterfactual frame (should be ~1: the key box matched every recorded frame checked)
+    if extensions.factor_heads or extensions.object_heads:  # how well the discovered factors are read from real, imagined and counterfactual latents
+      real_end = embeddings.shape[1]
+      imagined_end = real_end + sum(latents.shape[1] for latents, _ in imagined)
+      parts = [("real", slice(0, real_end)), ("imagined", slice(real_end, imagined_end))] + ([("counterfactual", slice(imagined_end, None))] if changed_grids else [])
+      for index, logits in enumerate(region_logits if books else []):
+        target = all_codes[..., index]
+        metrics[f"factor{index}_known_share"] = (target[:, :real_end] >= 0).float().mean()
+        for part, positions in parts:
+          known = target[:, positions] >= 0
+          metrics[f"factor{index}_accuracy_{part}"] = ((logits[:, positions].argmax(dim=-1) == target[:, positions]) & known).sum() / known.sum().clamp(min=1)
+      for index in range(len(shapes)):  # per object family: share of its occupied patches the head finds, and of the patches it marks that are right
+        predicted, target = object_logits[:, :, index] > 0, all_occupancy[:, :, index] > 0.5
+        for part, positions in parts:
+          hits = (predicted[:, positions] & target[:, positions]).sum()
+          metrics[f"object{index}_recall_{part}"] = hits / target[:, positions].sum().clamp(min=1)
+          metrics[f"object{index}_precision_{part}"] = hits / predicted[:, positions].sum().clamp(min=1)
     self.log_dict({"val/loss": loss.detach(), **{f"val/{name}": value.detach() for name, (_, value) in terms.items()}, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
   return {"loss": loss, **{name: value for name, (_, value) in terms.items()}}
 
@@ -707,6 +828,33 @@ def main(cfg: DictConfig) -> None:
   if not cfg.extensions.fact_heads:  # the same for the fact heads
     with open_dict(cfg):
       cfg.model.pop("fact_decoder", None)
+  factor_books, object_shapes = [], []
+  if cfg.extensions.factor_heads or cfg.extensions.object_heads:  # what training/factor_discovery.py found: regions with codebooks, object families with shapes
+    folder = Path(cfg.factors.path) if Path(cfg.factors.path).is_absolute() else stablewm_home() / cfg.factors.path
+    found = json.loads((folder / "factors.json").read_text(encoding="utf-8"))
+    stored = np.load(folder / "factors.npz")
+    if cfg.extensions.factor_heads:
+      factor_books = [stored[f"codebook_{index}"] for index in range(len(found["regions"]))]
+      if not factor_books or min(len(book) for book in factor_books) < 2:
+        raise ValueError(f"{folder}: factor heads need at least one region with at least two looks")
+    if cfg.extensions.object_heads:
+      object_shapes = [[stored[f"object_{family}_template_{index}"] for index in range(entry["templates"])] for family, entry in enumerate(found.get("objects", []))]
+      if not object_shapes:
+        raise ValueError(f"{folder}: object heads need object families (training/factor_discovery.py --objects)")
+    with open_dict(cfg):
+      cfg.model.factor_decoder.output_dim = int(sum(len(book) for book in factor_books) + 256 * len(object_shapes))  # one class per region look, 256 patches per object family
+      cfg.factors.boxes = [region["box"] for region in found["regions"]] if factor_books else []  # [row0, row1, col0, col1] per region (end excluded); saved with the run
+      cfg.factors.sizes = [len(book) for book in factor_books]
+      cfg.factors.object_colours = [entry["colour"] for entry in found.get("objects", [])] if object_shapes else []
+      cfg.factors.object_templates = [len(family) for family in object_shapes]
+    print(f"Discovered factors from {folder}: regions {list(cfg.factors.boxes)} with {list(cfg.factors.sizes)} looks; object families with colours {list(cfg.factors.object_colours)} and {list(cfg.factors.object_templates)} shapes")
+  else:
+    with open_dict(cfg):
+      cfg.model.pop("factor_decoder", None)
+  if cfg.extensions.counterfactual_factors and not cfg.extensions.factor_heads:
+    raise ValueError("extensions.counterfactual_factors needs extensions.factor_heads")
+  if cfg.extensions.counterfactual_objects and not cfg.extensions.object_heads:
+    raise ValueError("extensions.counterfactual_objects needs extensions.object_heads")
   model = hydra.utils.instantiate(cfg.model, )
 
   init_weights = cfg.get("init_weights")
@@ -738,6 +886,13 @@ def main(cfg: DictConfig) -> None:
   module = spt.Module(model=model, sigreg=SIGReg(**cfg.loss.sigreg.kwargs, ), forward=partial(lewm_forward, cfg=cfg, ), optim=optimizers, )
   if cfg.extensions.counterfactual_keys:  # what lewm_forward needs to draw counterfactual frames on the GPU
     module.register_buffer("key_patches", torch.as_tensor(dataset.key_patches), persistent=False)  # [shapes, colours, rotations, 6, 6]; moves with the module, not saved
+    module.grid_to_pixels = ArcGridToPixels(cfg.img_size)
+  for index, book in enumerate(factor_books):  # the discovered regions' looks, matched against every frame in lewm_forward
+    module.register_buffer(f"factor_codebook_{index}", torch.as_tensor(book), persistent=False)  # [looks, rows, columns] uint8
+  for family, shapes in enumerate(object_shapes):  # the object families' exact shapes, matched against every frame in lewm_forward
+    for index, shape in enumerate(shapes):
+      module.register_buffer(f"object_template_{family}_{index}", torch.as_tensor(shape), persistent=False)  # [height, width] uint8, 1 = the object's pixels
+  if cfg.extensions.counterfactual_factors or cfg.extensions.counterfactual_objects:
     module.grid_to_pixels = ArcGridToPixels(cfg.img_size)
 
   data_module = spt.data.DataModule(train=train_loader, val=val_loader, )

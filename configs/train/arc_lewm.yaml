@@ -41,7 +41,14 @@ extensions:  # defaults = plain LeWM (one_step_loss only); switch on the additio
   delta_jepa: false  # Delta-JEPA (arXiv:2606.31232): an action decoder names the action from z_t+1 - z_t (adds model.action_decoder and loss.action)
   fact_heads: false  # heads name the game facts (player cell, energy, refills left, key shape, rotation, colour) from real and imagined latents (adds model.fact_decoder and loss.facts); needs datasets/<game>/<dataset>_facts/ (environments/arc_facts.py)
   latent_shaping: false  # the squared latent distance of two frames of a window follows D^2 of their facts (loss.shaping); needs the same facts
+  factor_heads: false  # heads name the look of the screen regions found by training/factor_discovery.py (no game engine, nobody names what matters), from real and imagined latents (adds model.factor_decoder and loss.factors); needs factors.path
+  object_heads: false  # heads say where the object families found by training/factor_discovery.py --objects are (which 4x4 patches hold one), from real and imagined latents (adds 256 outputs per family to model.factor_decoder and loss.objects); needs factors.path
+  counterfactual_objects: false  # with object_heads: one frame per window is also shown with one object family removed (filled with the frame's most common colour)
+  counterfactual_factors: false  # with factor_heads: one frame per window is also shown with another look of one region, taken from its codebook (looks seen in the data)
   counterfactual_keys: false  # with fact_heads and/or latent_shaping: one frame per window is also shown with another key shape, colour or rotation (key_patches.npz of the facts), the only frames that differ in one key property alone
+
+factors:  # extensions.factor_heads / object_heads
+  path: null  # folder with factors.npz / factors.json written by training/factor_discovery.py (absolute, or relative to $STABLEWM_HOME)
 
 wm:
   history_size: 3  # latents the predictor attends to; LeWM's one-step loss uses windows of history_size + 1 = 4 frames
@@ -96,6 +103,10 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  factors:  # extensions.factor_heads
+    weight: 0.5  # as loss.facts
+  objects:  # extensions.object_heads
+    weight: 0.5  # binary cross-entropy over the 256 patches per family (occupied patches count 10 times), the mean over all
   facts:  # extensions.fact_heads
     weight: 0.5  # the mean over the heads starts near 1.7 (cross-entropies of 4-12 classes) and so begins at the size of Delta-JEPA's action term (0.5 * ln 7)
   shaping:  # extensions.latent_shaping
