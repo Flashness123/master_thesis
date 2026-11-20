@@ -31,7 +31,7 @@ class JEPA(nn.Module):
   """
   def __init__(self, encoder, predictor, action_encoder, projector=None, pred_proj=None, action_decoder=None, fact_decoder=None, factor_decoder=None, ):
     super().__init__()
-    self.factor_decoder = factor_decoder  # factor heads (optional): the look of the screen regions found by training/factor_discovery.py. None = no factor heads.
+    self.factor_decoder = factor_decoder  # factor heads (optional): the look of the screen regions and four numbers per object family found by training/factor_discovery.py. None = none.
 
     self.encoder = encoder
     self.predictor = predictor
@@ -119,12 +119,14 @@ class JEPA(nn.Module):
 
   def decode_factors(self, emb):
     """
-    The factor heads: read which look every discovered screen region has (training/factor_discovery.py found the regions
-    without the game engine; each look in its codebook is a class).
+    The factor heads: read which look every discovered screen region has, and four numbers per discovered object family
+    (training/factor_discovery.py found both without the game engine; each look in a region's codebook is a class; per
+    family: count, area, centre row and column of its objects, normalised).
 
     GETS:    emb -- latents [..., 192], real or imagined.
     DOES:    one MLP over the feature dim, flattened as in decode_facts.
-    RETURNS: logits [..., sum of the codebook sizes]; training/lewm.py splits them per region (cfg.factors.sizes).
+    RETURNS: outputs [..., sum of the codebook sizes + 4 per family]; training/lewm.py splits them per region (cfg.factors.sizes)
+             and per family.
     """
     return self.factor_decoder(emb.reshape(-1, emb.size(-1))).reshape(*emb.shape[:-1], -1)
 

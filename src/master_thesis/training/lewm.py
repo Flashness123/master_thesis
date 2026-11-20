@@ -505,32 +505,42 @@ def region_codes(grids, boxes, books):
     codes.append(torch.where(match.any(dim=-1), match.float().argmax(dim=-1), torch.full((len(grids),), -1, device=grids.device, dtype=torch.long)))
   return torch.stack(codes, dim=-1)
 
-def object_occupancy(grids, colours, shapes):
+def find_objects(grids, colours, shapes):
   """
   GETS:    grids [N, 64, 64] colour indices; colours -- per discovered object family its colour; shapes -- per family its
            exact shapes, [height, width] masks (1 = the object's pixels; training/factor_discovery.py --objects).
   DOES:    an object of a family sits where every pixel of one of its shapes has the family's colour and none of the pixels
            next to the shape (4-neighbourhood) has it: exactly a connected area of that shape, as discovery found them.
            Found by two convolutions per shape (outside the grid counts as another colour).
-  RETURNS: (occupancy [N, families, 256] float: which 4x4 patches of the grid hold an object's top-left pixel,
-            pixels [N, families, 64, 64] bool: the pixels of the objects found).
+  RETURNS: {"descriptor": [N, families, 4] float -- the same four numbers for every family: how many objects, how many pixels
+                          they cover, the row and the column of the centre of those pixels (centre 0 without objects),
+            "occupancy":  [N, families, 256] float -- which 4x4 patches of the grid hold an object's top-left pixel,
+            "pixels":     [N, families, 64, 64] bool -- the objects' pixels,
+            "starts":     [N, families, 64, 64] long -- at each object's top-left pixel 1 + the index of its shape, else 0}
   """
   plus = torch.tensor([[0., 1., 0.], [1., 1., 1.], [0., 1., 0.]], device=grids.device)[None, None]
-  occupancy, pixels = [], []
+  places = torch.arange(64, device=grids.device, dtype=torch.float32)
+  descriptors, occupancy, pixels, all_starts = [], [], [], []
   with torch.autocast(device_type=grids.device.type, enabled=False):  # exact counts
     for colour, family in zip(colours, shapes):
       is_colour = F.pad((grids == colour).float()[:, None], (1, 1, 1, 1))  # [N, 1, 66, 66]
-      starts, covered = torch.zeros(len(grids), 64, 64, device=grids.device), torch.zeros(len(grids), 64, 64, device=grids.device)
-      for shape in family:
+      starts = torch.zeros(len(grids), 64, 64, device=grids.device, dtype=torch.long)
+      covered = torch.zeros(len(grids), 64, 64, device=grids.device)
+      for index, shape in enumerate(family):
         inside = F.pad(shape.float(), (1, 1, 1, 1))[None, None]  # [1, 1, h + 2, w + 2]
         border = (F.conv2d(inside, plus, padding=1) > 0).float() - inside  # the pixels next to the shape
         match = ((F.conv2d(is_colour, inside).round() == inside.sum()) & (F.conv2d(is_colour, border).round() == 0)).float()  # [N, 1, 65 - h, 65 - w]: position = the shape's top-left pixel (rounded: batched convolutions are not exact)
         rows, columns = match.shape[2], match.shape[3]
-        starts[:, :rows, :columns] = torch.maximum(starts[:, :rows, :columns], match[:, 0])
+        starts[:, :rows, :columns] = torch.where(match[:, 0] > 0, torch.full_like(starts[:, :rows, :columns], index + 1), starts[:, :rows, :columns])
         covered = torch.maximum(covered, F.conv_transpose2d(match, shape.float()[None, None])[:, 0].clamp(max=1))  # the shape stamped at every match: [N, 64, 64]
-      occupancy.append(F.max_pool2d(starts[:, None], 4)[:, 0].flatten(1))
+      area = covered.sum(dim=(1, 2))
+      centre_row = (covered.sum(dim=2) * places).sum(dim=1) / area.clamp(min=1)
+      centre_column = (covered.sum(dim=1) * places).sum(dim=1) / area.clamp(min=1)
+      descriptors.append(torch.stack([(starts > 0).sum(dim=(1, 2)).float(), area, centre_row, centre_column], dim=-1))
+      occupancy.append(F.max_pool2d((starts > 0).float()[:, None], 4)[:, 0].flatten(1))
       pixels.append(covered > 0)
-  return torch.stack(occupancy, dim=1), torch.stack(pixels, dim=1)
+      all_starts.append(starts)
+  return {"descriptor": torch.stack(descriptors, dim=1), "occupancy": torch.stack(occupancy, dim=1), "pixels": torch.stack(pixels, dim=1), "starts": torch.stack(all_starts, dim=1)}
 
 def lewm_forward(self, batch, stage, cfg, ):
   """
@@ -695,11 +705,14 @@ def lewm_forward(self, batch, stage, cfg, ):
     # The factors found by training/factor_discovery.py (from the latent's blind spots, without the game engine and without anyone naming what
     # matters), read straight from the grid of each frame:
     #   factor heads  the look of every fixed screen region (region_codes; -1 = a look not in its codebook, left out)
-    #   object heads  where the objects of every family are (object_occupancy: which 4x4 patches hold one), so the latent keeps how many there are
-    #                 and where (refills, goal symbols, pushers, lives, ...)
+    #   object heads  four numbers per object family (find_objects), the same for every family whatever it is: how many objects, how many pixels
+    #                 they cover, the row and the column of their centre -- appearing / disappearing (refills, lives, goal symbols), changing size,
+    #                 moving. Divided by the family's largest count and area in discovery and by 64; squared error, the centre only where the
+    #                 family has objects
     # From real latents, every imagined one above (against the frame it predicts) and the counterfactual frames: with counterfactual_factors one
     # frame per window shows another look of one region from its codebook, with counterfactual_objects one frame per window shows one object
-    # family removed (its pixels get the frame's most common colour, the floor). Their targets are read from the changed frame; no transition is added.
+    # removed (its pixels get the frame's most common colour, the floor): one refill taken. Their targets are read from the changed frame; no
+    # transition is added.
     window_grids = batch["grid"].reshape(*batch["grid"].shape[:2], 64, 64)  # [B, T, 64, 64]
     batch_size, window_frames = window_grids.shape[:2]
     windows = torch.arange(batch_size, device=window_grids.device)
@@ -711,9 +724,11 @@ def lewm_forward(self, batch, stage, cfg, ):
       codes = region_codes(flat, cfg.factors.boxes, books).unflatten(0, (batch_size, window_frames))  # [B, T, regions]
       region_targets = [codes] + [codes[:, frames] for _, frames in imagined]
     if shapes:
-      occupancy, object_pixels = object_occupancy(flat, cfg.factors.object_colours, shapes)
-      occupancy, object_pixels = occupancy.unflatten(0, (batch_size, window_frames)), object_pixels.unflatten(0, (batch_size, window_frames))  # [B, T, families, 256], [B, T, families, 64, 64]
-      object_targets = [occupancy] + [occupancy[:, frames] for _, frames in imagined]
+      scale = torch.tensor([[count, area, 64.0, 64.0] for count, area in cfg.factors.object_scales], device=window_grids.device)  # [families, 4]
+      found = find_objects(flat, cfg.factors.object_colours, shapes)
+      descriptor = (found["descriptor"] / scale).unflatten(0, (batch_size, window_frames))  # [B, T, families, 4]
+      object_starts = found["starts"].unflatten(0, (batch_size, window_frames))  # [B, T, families, 64, 64]
+      object_targets = [descriptor] + [descriptor[:, frames] for _, frames in imagined]
     changed_grids = []  # the counterfactual frames, one per window each  [B, 64, 64]
     if extensions.counterfactual_factors:
       chosen = torch.randint(window_frames, (batch_size,), device=window_grids.device)
@@ -728,18 +743,29 @@ def lewm_forward(self, batch, stage, cfg, ):
       changed_grids.append(grid)
     if extensions.counterfactual_objects:
       chosen = torch.randint(window_frames, (batch_size,), device=window_grids.device)
-      present = occupancy[windows, chosen].amax(dim=-1)  # [B, families]: 1 where the frame has an object of the family
-      family = torch.multinomial(present + 1e-6, 1)[:, 0]  # a family present in the frame (any, if none is)
+      starts = object_starts[windows, chosen]  # [B, families, 64, 64]
+      present = (starts > 0).flatten(2).any(dim=-1).float()  # [B, families]: 1 where the frame has an object of the family
+      family = torch.multinomial(present.masked_fill(present.sum(dim=1, keepdim=True) == 0, 1.0), 1)[:, 0]  # a family present in the frame (any, if none is)
+      family_starts = starts[windows, family].flatten(1)  # [B, 4096]
+      objects = (family_starts > 0).float()
+      pick = torch.multinomial(objects.masked_fill(objects.sum(dim=1, keepdim=True) == 0, 1.0), 1)[:, 0]  # one of its objects (if it has none, any pixel: nothing is removed below)
+      shape_index = family_starts[windows, pick]  # 1 + the index of that object's shape, 0 = no object there
+      at = F.one_hot(pick, 64 * 64).float().reshape(batch_size, 1, 64, 64)
+      erase = torch.zeros(batch_size, 64, 64, dtype=torch.bool, device=window_grids.device)
+      for index, family_shapes in enumerate(shapes):
+        for number, shape in enumerate(family_shapes):  # the object's shape stamped at its top-left pixel, in the windows whose object has this shape (no host sync)
+          selected = ((family == index) & (shape_index == number + 1)).float()[:, None, None, None]
+          erase |= F.conv_transpose2d(at * selected, shape.float()[None, None])[:, 0, :64, :64] > 0.5
       grid = window_grids[windows, chosen]
       floor = torch.mode(grid.flatten(1).long(), dim=1).values  # the frame's most common colour
-      changed_grids.append(torch.where(object_pixels[windows, chosen, family], floor[:, None, None].to(grid.dtype), grid))
+      changed_grids.append(torch.where(erase, floor[:, None, None].to(grid.dtype), grid))
     for grid in changed_grids:
       factor_latents.append(self.model.encode({"pixels": self.grid_to_pixels(grid.reshape(-1, 64 * 64))[:, None]})["emb"])  # [B, 1, 192]
       if books:
         region_targets.append(region_codes(grid, cfg.factors.boxes, books)[:, None])
       if shapes:
-        object_targets.append(object_occupancy(grid, cfg.factors.object_colours, shapes)[0][:, None])
-    outputs = self.model.decode_factors(torch.cat(factor_latents, dim=1))  # [B, N, sum of the looks + 256 per family]
+        object_targets.append((find_objects(grid, cfg.factors.object_colours, shapes)["descriptor"] / scale)[:, None])
+    outputs = self.model.decode_factors(torch.cat(factor_latents, dim=1))  # [B, N, sum of the looks + 4 per family]
     looks = sum(cfg.factors.sizes)
     if books:
       region_logits = outputs[..., :looks].split(list(cfg.factors.sizes), dim=-1)  # per region [B, N, looks]
@@ -748,10 +774,11 @@ def lewm_forward(self, batch, stage, cfg, ):
                        for index, logits in enumerate(region_logits)]
       terms["factor_loss"] = (cfg.loss.factors.weight, torch.stack(factor_losses).mean())
     if shapes:
-      object_logits = outputs[..., looks:].unflatten(-1, (len(shapes), 256))  # [B, N, families, 256]
-      all_occupancy = torch.cat(object_targets, dim=1)
-      # occupied patches are rare (a few of 256), so a found object counts 10 times as much as an empty patch
-      terms["object_loss"] = (cfg.loss.objects.weight, F.binary_cross_entropy_with_logits(object_logits.float(), all_occupancy, pos_weight=torch.tensor(10.0, device=object_logits.device)))
+      object_outputs = outputs[..., looks:].unflatten(-1, (len(shapes), 4)).float()  # [B, N, families, 4]
+      all_descriptors = torch.cat(object_targets, dim=1)  # [B, N, families, 4]
+      has_objects = (all_descriptors[..., :1] > 0).float()  # the centre counts only where the family has objects
+      counted = torch.cat([torch.ones_like(has_objects), torch.ones_like(has_objects), has_objects, has_objects], dim=-1)
+      terms["object_loss"] = (cfg.loss.objects.weight, ((object_outputs - all_descriptors).pow(2) * counted).sum() / counted.sum().clamp(min=1))
 
   loss = sum(weight * value for weight, value in terms.values())
 
@@ -796,12 +823,13 @@ def lewm_forward(self, batch, stage, cfg, ):
         for part, positions in parts:
           known = target[:, positions] >= 0
           metrics[f"factor{index}_accuracy_{part}"] = ((logits[:, positions].argmax(dim=-1) == target[:, positions]) & known).sum() / known.sum().clamp(min=1)
-      for index in range(len(shapes)):  # per object family: share of its occupied patches the head finds, and of the patches it marks that are right
-        predicted, target = object_logits[:, :, index] > 0, all_occupancy[:, :, index] > 0.5
+      for index, (count_scale, area_scale) in enumerate(cfg.factors.object_scales if shapes else []):  # per object family, in game units: count right, area and centre off by how many pixels
         for part, positions in parts:
-          hits = (predicted[:, positions] & target[:, positions]).sum()
-          metrics[f"object{index}_recall_{part}"] = hits / target[:, positions].sum().clamp(min=1)
-          metrics[f"object{index}_precision_{part}"] = hits / predicted[:, positions].sum().clamp(min=1)
+          predicted, target = object_outputs[:, positions, index], all_descriptors[:, positions, index]
+          present = target[..., 0] > 0
+          metrics[f"object{index}_count_accuracy_{part}"] = ((predicted[..., 0] * count_scale).round() == (target[..., 0] * count_scale).round()).float().mean()
+          metrics[f"object{index}_area_error_{part}"] = ((predicted[..., 1] - target[..., 1]).abs() * area_scale).mean()
+          metrics[f"object{index}_centre_error_{part}"] = ((predicted[..., 2:] - target[..., 2:]).pow(2).sum(dim=-1).sqrt() * 64)[present].sum() / present.sum().clamp(min=1)
     self.log_dict({"val/loss": loss.detach(), **{f"val/{name}": value.detach() for name, (_, value) in terms.items()}, **{f"val/{name}": value for name, value in metrics.items()}, }, on_step=False, on_epoch=True, batch_size=embeddings.shape[0], sync_dist=True, )  # on_epoch=True -> Lightning averages each metric over the whole val set before logging
   return {"loss": loss, **{name: value for name, (_, value) in terms.items()}}
 
@@ -841,12 +869,15 @@ def main(cfg: DictConfig) -> None:
       object_shapes = [[stored[f"object_{family}_template_{index}"] for index in range(entry["templates"])] for family, entry in enumerate(found.get("objects", []))]
       if not object_shapes:
         raise ValueError(f"{folder}: object heads need object families (training/factor_discovery.py --objects)")
+      if any("max_count" not in entry for entry in found["objects"]):
+        raise ValueError(f"{folder}: written before the object heads' four numbers (no max_count / max_area); run training/factor_discovery.py --objects again")
     with open_dict(cfg):
-      cfg.model.factor_decoder.output_dim = int(sum(len(book) for book in factor_books) + 256 * len(object_shapes))  # one class per region look, 256 patches per object family
+      cfg.model.factor_decoder.output_dim = int(sum(len(book) for book in factor_books) + 4 * len(object_shapes))  # one class per region look, four numbers per object family
       cfg.factors.boxes = [region["box"] for region in found["regions"]] if factor_books else []  # [row0, row1, col0, col1] per region (end excluded); saved with the run
       cfg.factors.sizes = [len(book) for book in factor_books]
       cfg.factors.object_colours = [entry["colour"] for entry in found.get("objects", [])] if object_shapes else []
       cfg.factors.object_templates = [len(family) for family in object_shapes]
+      cfg.factors.object_scales = [[max(entry["max_count"], 1), max(entry["max_area"], 1)] for entry in found["objects"]] if object_shapes else []  # the object heads' count and area are divided by these
     print(f"Discovered factors from {folder}: regions {list(cfg.factors.boxes)} with {list(cfg.factors.sizes)} looks; object families with colours {list(cfg.factors.object_colours)} and {list(cfg.factors.object_templates)} shapes")
   else:
     with open_dict(cfg):
@@ -862,15 +893,19 @@ def main(cfg: DictConfig) -> None:
   if init_weights:
     checkpoint = Path(init_weights)
 
-    saved_model_config = OmegaConf.load(checkpoint.parent / "model_config.json")  # architecture saved next to weights.pt
+    saved_model_config = OmegaConf.to_container(OmegaConf.load(checkpoint.parent / "model_config.json"), resolve=True)  # architecture saved next to weights.pt
+    current_model_config = OmegaConf.to_container(cfg.model, resolve=True)
+    new_heads = [name for name in ("fact_decoder", "factor_decoder") if name in current_model_config and name not in saved_model_config]  # heads this run adds to the source (start fresh)
 
-    if (OmegaConf.to_container(saved_model_config, resolve=True) != OmegaConf.to_container(cfg.model, resolve=True)):
+    if saved_model_config != {key: value for key, value in current_model_config.items() if key not in new_heads}:
       raise ValueError("Current model configuration differs from the source checkpoint")
 
     state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True, )
 
-    model.load_state_dict(state_dict, strict=True)
-    print(f"Initialized LeWM from: {checkpoint}")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected or any(not key.startswith(tuple(f"{name}." for name in new_heads)) for key in missing):
+      raise ValueError(f"Source checkpoint does not fit beyond the new heads {new_heads}: missing {missing}, unexpected {unexpected}")
+    print(f"Initialized LeWM from: {checkpoint}" + (f" (new heads start fresh: {new_heads})" if new_heads else ""))
 
   max_steps = cfg.trainer.get("max_steps") or -1  # if set (> 0), the run length is given in optimizer steps (use with trainer.max_epochs=-1)
   total_steps = max_steps if max_steps > 0 else cfg.trainer.max_epochs * len(train_loader)  # length of the learning-rate schedule

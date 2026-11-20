@@ -41,11 +41,11 @@ fact_decoder:  # fact heads: reads the game facts (models/lewm/jepa.py FACT_HEAD
   hidden_dim: 512
   output_dim: 47  # the sum of FACT_HEADS: player x 12 + player y 12 + energy 1 + refills left 8 + key shape 6 + key rotation 4 + key colour 4 (43 without colour before 17 Nov)
 
-factor_decoder:  # factor heads: reads the look of every screen region found by training/factor_discovery.py; built only with extensions.factor_heads (training/lewm.py drops it otherwise)
+factor_decoder:  # factor / object heads: the look of every screen region and four numbers per object family found by training/factor_discovery.py; built only with extensions.factor_heads / object_heads (training/lewm.py drops it otherwise)
   _target_: master_thesis.models.lewm.MLP
   input_dim: ${embed_dim}
   hidden_dim: 512
-  output_dim: null  # set by training/lewm.py: the sum of the regions' codebook sizes
+  output_dim: null  # set by training/lewm.py: the sum of the regions' codebook sizes + 4 per object family
 
 projector:
   _target_: master_thesis.models.lewm.MLP
